@@ -67,10 +67,17 @@ def compute_wolf_trade_stats(state_dir):
 
 
 def _find_scan_file(instance_workspace, filename):
-    """Resolve a scan file: per-instance workspace first, shared workspace fallback."""
+    """Resolve a scan file across standard locations.
+
+    Search order: workspace root, history/ subdir (wolf convention),
+    then shared workspace fallback.
+    """
     instance_path = os.path.join(instance_workspace, filename)
     if os.path.exists(instance_path):
         return instance_path
+    history_path = os.path.join(instance_workspace, "history", filename)
+    if os.path.exists(history_path):
+        return history_path
     shared_path = os.path.join(get_shared_workspace(), filename)
     if os.path.exists(shared_path):
         return shared_path

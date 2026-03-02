@@ -229,8 +229,26 @@ def ensure_instance_workspace(instance_id):
 
 
 def get_instance_state_dir(instance_id, instance_type):
-    """Get the state directory for a spawned instance's strategy."""
-    return os.path.join(WORKSPACE, "state", instance_id)
+    """Get the state directory for a spawned instance's strategy.
+
+    WOLF/TIGER scripts store state under {instance_workspace}/state/{key}/
+    where key is instance_id (wolf convention) or strategyId (tiger convention).
+    Searches for the actual directory to handle both cases.
+    """
+    instance_ws = get_instance_workspace(instance_id, instance_type)
+    state_root = os.path.join(instance_ws, "state")
+
+    candidate = os.path.join(state_root, instance_id)
+    if os.path.isdir(candidate):
+        return candidate
+
+    if os.path.isdir(state_root):
+        for entry in os.listdir(state_root):
+            path = os.path.join(state_root, entry)
+            if os.path.isdir(path):
+                return path
+
+    return os.path.join(state_root, instance_id)
 
 
 # --- MCP helpers (from GUIDE.md pattern) ---

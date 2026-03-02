@@ -951,6 +951,223 @@ class TestTigerScriptsResolution(unittest.TestCase):
             shutil.rmtree(tmpdir)
 
 
+class TestInstanceStateDir(unittest.TestCase):
+    """get_instance_state_dir must resolve inside instance workspace."""
+
+    def test_wolf_state_dir_by_instance_id(self):
+        """Wolf state dir is {instance_workspace}/state/{instance_id}/."""
+        import cobra_config
+        tmpdir = tempfile.mkdtemp()
+        try:
+            iid = "wolf-abc123"
+            state_path = os.path.join(tmpdir, "instances", iid, "state", iid)
+            os.makedirs(state_path)
+            with patch.object(cobra_config, "WORKSPACE", tmpdir):
+                result = cobra_config.get_instance_state_dir(iid, "wolf")
+            self.assertEqual(result, state_path)
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_tiger_state_dir_by_strategy_id(self):
+        """Tiger state dir resolves to first subdir under state/ (strategyId)."""
+        import cobra_config
+        tmpdir = tempfile.mkdtemp()
+        try:
+            iid = "tiger-def456"
+            strategy_uuid = "def456-1234-5678-9abc-ffffffffffff"
+            state_path = os.path.join(tmpdir, "instances", iid, "state", strategy_uuid)
+            os.makedirs(state_path)
+            with patch.object(cobra_config, "WORKSPACE", tmpdir):
+                result = cobra_config.get_instance_state_dir(iid, "tiger")
+            self.assertEqual(result, state_path)
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_fallback_when_no_state_subdir(self):
+        """Falls back to state/{instance_id} when no subdirectory exists."""
+        import cobra_config
+        tmpdir = tempfile.mkdtemp()
+        try:
+            iid = "wolf-nostate"
+            with patch.object(cobra_config, "WORKSPACE", tmpdir):
+                result = cobra_config.get_instance_state_dir(iid, "wolf")
+            self.assertTrue(result.endswith(os.path.join("state", iid)))
+        finally:
+            shutil.rmtree(tmpdir)
+
+
+class TestFindScanFile(unittest.TestCase):
+    """_find_scan_file must check history/ subdirectory for wolf scan data."""
+
+    def _load_signals(self):
+        return _import_hyphenated(
+            "cobra_signals", os.path.join(SCRIPTS_DIR, "cobra-signals.py"))
+
+    def test_finds_file_at_workspace_root(self):
+        signals = self._load_signals()
+        tmpdir = tempfile.mkdtemp()
+        try:
+            fpath = os.path.join(tmpdir, "scan-history.json")
+            with open(fpath, "w") as f:
+                json.dump([], f)
+            result = signals._find_scan_file(tmpdir, "scan-history.json")
+            self.assertEqual(result, fpath)
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_finds_file_in_history_subdir(self):
+        """Wolf puts scan-history.json in history/ — must find it."""
+        signals = self._load_signals()
+        tmpdir = tempfile.mkdtemp()
+        try:
+            hist_dir = os.path.join(tmpdir, "history")
+            os.makedirs(hist_dir)
+            fpath = os.path.join(hist_dir, "scan-history.json")
+            with open(fpath, "w") as f:
+                json.dump([], f)
+            result = signals._find_scan_file(tmpdir, "scan-history.json")
+            self.assertEqual(result, fpath)
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_falls_back_to_shared_workspace(self):
+        signals = self._load_signals()
+        tmpdir = tempfile.mkdtemp()
+        shared = tempfile.mkdtemp()
+        try:
+            fpath = os.path.join(shared, "emerging-movers-history.json")
+            with open(fpath, "w") as f:
+                json.dump([], f)
+            with patch.object(signals, "get_shared_workspace", return_value=shared):
+                result = signals._find_scan_file(tmpdir, "emerging-movers-history.json")
+            self.assertEqual(result, fpath)
+        finally:
+            shutil.rmtree(tmpdir)
+            shutil.rmtree(shared)
+
+
+class TestCreateAndFundWallet(unittest.TestCase):
+    """Wallet creation must unwrap MCP response wrapper and handle async status."""
+
+    def _load_spawner(self):
+        return _import_hyphenated(
+            "cobra_spawner", os.path.join(SCRIPTS_DIR, "cobra-spawner.py"))
+
+    def test_unwraps_strategy_wrapper(self):
+        """MCP returns {strategy: {strategyWalletAddress, id, ...}} — must unwrap."""
+        spawner = self._load_spawner()
+        create_resp = {
+            "strategy": {
+                "strategyWalletAddress": "0xWALLET_ABC",
+                "id": "uuid-123",
+                "status": "ACTIVE",
+            }
+        }
+        ch_resp = {"main": {"marginSummary": {"accountValue": "5000"}}}
+        with patch.object(spawner, "mcporter_call", return_value=create_resp), \
+             patch.object(spawner, "mcporter_call_safe", return_value=None), \
+             patch.object(spawner, "get_clearinghouse_state", return_value=ch_resp), \
+             patch.object(spawner, "parse_clearinghouse",
+                          return_value=({"accountValue": "5000"}, [])), \
+             patch.object(spawner, "time") as mock_time:
+            mock_time.sleep = MagicMock()
+            result = spawner._create_and_fund_wallet(5000, "test-strat")
+        self.assertIsInstance(result, tuple)
+        wallet, sid = result
+        self.assertEqual(wallet, "0xWALLET_ABC")
+        self.assertEqual(sid, "uuid-123")
+
+    def test_polls_on_create_wallet_status(self):
+        """When MCP returns status=CREATE_WALLET, must poll until ACTIVE."""
+        spawner = self._load_spawner()
+        create_resp = {
+            "strategy": {
+                "strategyWalletAddress": "",
+                "id": "uuid-456",
+                "status": "CREATE_WALLET",
+            }
+        }
+        ch_resp = {"main": {"marginSummary": {"accountValue": "3000"}}}
+
+        with patch.object(spawner, "mcporter_call", return_value=create_resp), \
+             patch.object(spawner, "mcporter_call_safe", side_effect=[
+                 {"strategies": [{"id": "uuid-456", "status": "CREATE_WALLET"}]},
+                 {"strategies": [{"id": "uuid-456", "status": "ACTIVE",
+                                  "strategyWalletAddress": "0xPOLLED"}]},
+             ]), \
+             patch.object(spawner, "get_clearinghouse_state", return_value=ch_resp), \
+             patch.object(spawner, "parse_clearinghouse",
+                          return_value=({"accountValue": "3000"}, [])), \
+             patch.object(spawner, "time") as mock_time, \
+             patch.object(spawner, "_STRATEGY_POLL_MAX_WAIT", 10):
+            mock_time.time = MagicMock(side_effect=[0, 1, 2])
+            mock_time.sleep = MagicMock()
+            result = spawner._create_and_fund_wallet(3000, "test-poll")
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(result[0], "0xPOLLED")
+
+    def test_poll_detects_failed_status(self):
+        """When strategy creation fails, poll returns None."""
+        spawner = self._load_spawner()
+        list_resp = {"strategies": [{"id": "uuid-789", "status": "FAILED"}]}
+        with patch.object(spawner, "mcporter_call_safe", return_value=list_resp), \
+             patch.object(spawner, "time") as mock_time, \
+             patch.object(spawner, "_STRATEGY_POLL_MAX_WAIT", 5):
+            mock_time.time = MagicMock(side_effect=[0, 1])
+            mock_time.sleep = MagicMock()
+            result = spawner._poll_strategy_wallet("uuid-789")
+        self.assertIsNone(result)
+
+    def test_verification_uses_50pct_threshold(self):
+        """Wallet with >50% of budget funded passes verification."""
+        spawner = self._load_spawner()
+        create_resp = {
+            "strategy": {
+                "strategyWalletAddress": "0xOK",
+                "id": "uuid-thr",
+                "status": "ACTIVE",
+            }
+        }
+        with patch.object(spawner, "mcporter_call", return_value=create_resp), \
+             patch.object(spawner, "mcporter_call_safe", return_value=None), \
+             patch.object(spawner, "get_clearinghouse_state", return_value={}), \
+             patch.object(spawner, "parse_clearinghouse",
+                          return_value=({"accountValue": "2600"}, [])), \
+             patch.object(spawner, "time") as mock_time:
+            mock_time.sleep = MagicMock()
+            result = spawner._create_and_fund_wallet(5000, "test-thr")
+        self.assertIsInstance(result, tuple)
+
+    def test_verification_fails_below_50pct(self):
+        """Wallet with <50% of budget funded must fail and cleanup."""
+        spawner = self._load_spawner()
+        create_resp = {
+            "strategy": {
+                "strategyWalletAddress": "0xLOW",
+                "id": "uuid-low",
+                "status": "ACTIVE",
+            }
+        }
+        call_n = {"n": 0}
+
+        def mock_parse(ch):
+            call_n["n"] += 1
+            if call_n["n"] <= 1:
+                return {"accountValue": "100"}, []
+            return {"accountValue": "200"}, []
+
+        with patch.object(spawner, "mcporter_call", return_value=create_resp), \
+             patch.object(spawner, "mcporter_call_safe", return_value=None), \
+             patch.object(spawner, "get_clearinghouse_state", return_value={}), \
+             patch.object(spawner, "parse_clearinghouse", side_effect=mock_parse), \
+             patch.object(spawner, "time") as mock_time:
+            mock_time.sleep = MagicMock()
+            result = spawner._create_and_fund_wallet(5000, "test-low")
+        self.assertIsInstance(result, dict)
+        self.assertFalse(result["success"])
+        self.assertIn("Funding verification failed", result["error"])
+
+
 class TestKillFlowMCPFailure(unittest.TestCase):
     """TIGER kill with MCP failure must set kill_pending, not killed."""
 

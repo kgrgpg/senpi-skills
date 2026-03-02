@@ -255,29 +255,32 @@ def _compute_leverage(budget, regime="TRENDING"):
 
 
 _STRATEGY_POLL_INTERVAL = 5
-_STRATEGY_POLL_MAX_WAIT = 60
+_STRATEGY_POLL_MAX_WAIT = 120
 _MIN_TOP_UP = 1
 
 
 def _poll_strategy_wallet(strategy_uuid):
-    """Poll strategy_list until a newly created strategy has a wallet address.
+    """Poll strategy_list until a newly created strategy becomes ACTIVE.
 
-    strategy_create_custom_strategy is async — it returns immediately with a
-    strategyId but the wallet address appears later via strategy_list once
-    the on-chain wallet is provisioned.
+    strategy_create_custom_strategy is async — it returns status CREATE_WALLET
+    immediately. The wallet address appears in strategy_list once the on-chain
+    wallet is provisioned and status changes to ACTIVE.
+
+    Returns wallet address on success, None on timeout/failure.
     """
     deadline = time.time() + _STRATEGY_POLL_MAX_WAIT
     while time.time() < deadline:
-        strategies = mcporter_call_safe("strategy_list")
-        if strategies:
-            items = (strategies if isinstance(strategies, list)
-                     else strategies.get("strategies", strategies.get("data", [])))
-            for s in items:
-                sid = s.get("strategyId", s.get("id", ""))
-                if sid == strategy_uuid:
-                    wallet = s.get("wallet", s.get("address", ""))
-                    if wallet:
-                        return wallet
+        list_result = mcporter_call_safe("strategy_list")
+        if list_result:
+            strategies = list_result.get("strategies", [])
+            found = next((s for s in strategies if s.get("id") == strategy_uuid), None)
+            if found:
+                if found.get("status") == "FAILED":
+                    return None
+                wallet = found.get("strategyWalletAddress",
+                                   found.get("wallet", found.get("address", "")))
+                if wallet and found.get("status") == "ACTIVE":
+                    return wallet
         time.sleep(_STRATEGY_POLL_INTERVAL)
     return None
 
@@ -288,9 +291,10 @@ def _create_and_fund_wallet(budget, name, config=None):
     Handles Senpi MCP specifics discovered at runtime:
     - initialBudget must be int (MCP rejects float)
     - positions requires full objects with coin/leverage/leverageType/direction/marginAmount
-    - Creation is async: wallet address arrives via strategy_list polling
+    - Creation is async: returns status CREATE_WALLET, poll strategy_list for ACTIVE
+    - Response wraps in {strategy: {strategyWalletAddress, id, ...}}
     - Clearinghouse uses strategy_wallet param and nested main.marginSummary response
-    - Minimum top-up is $1
+    - Minimum top-up is $1; on-chain settlement needs ~3s before clearinghouse reflects
 
     Returns (wallet, strategy_uuid) on success.
     Returns an error dict on failure, cleaning up the orphaned strategy.
@@ -308,25 +312,30 @@ def _create_and_fund_wallet(budget, name, config=None):
                 "marginAmount": 1,
             }],
         )
-        wallet = create_result.get("wallet", create_result.get("address", ""))
-        strategy_uuid = create_result.get("strategyId", create_result.get("id", ""))
+        strategy_data = create_result.get("strategy", create_result)
+        wallet = strategy_data.get("strategyWalletAddress",
+                                   strategy_data.get("wallet",
+                                   strategy_data.get("address", "")))
+        strategy_uuid = strategy_data.get("id",
+                                          strategy_data.get("strategyId", ""))
     except RuntimeError as e:
         return {"success": False, "error": f"Failed to create strategy: {e}"}
 
-    if not wallet:
+    if not wallet or strategy_data.get("status") == "CREATE_WALLET":
         wallet = _poll_strategy_wallet(strategy_uuid)
     if not wallet:
         mcporter_call_safe("strategy_delete", strategyId=strategy_uuid)
         return {"success": False,
                 "error": f"Strategy {strategy_uuid} created but wallet never appeared"}
 
-    # Check if creation already funded the wallet via initialBudget.
+    # Let on-chain state settle before querying clearinghouse
+    time.sleep(3)
     ch = get_clearinghouse_state(wallet)
     ms, _ = parse_clearinghouse(ch)
     current_value = float(ms.get("accountValue", ms.get("equity", 0)))
 
     if current_value < budget * 0.95:
-        top_up_amount = budget - current_value
+        top_up_amount = round(budget - current_value, 2)
         if top_up_amount >= _MIN_TOP_UP:
             try:
                 mcporter_call("strategy_top_up",
@@ -336,10 +345,11 @@ def _create_and_fund_wallet(budget, name, config=None):
                 return {"success": False, "error": f"Failed to fund strategy: {e}",
                         "wallet": wallet, "strategyId": strategy_uuid}
 
+    time.sleep(3)
     ch = get_clearinghouse_state(wallet)
     ms, _ = parse_clearinghouse(ch)
     actual_value = float(ms.get("accountValue", ms.get("equity", 0)))
-    if actual_value < budget * 0.90:
+    if actual_value < budget * 0.50:
         mcporter_call_safe("strategy_delete", strategyId=strategy_uuid)
         return {
             "success": False,

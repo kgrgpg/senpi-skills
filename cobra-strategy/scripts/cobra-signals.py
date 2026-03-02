@@ -29,10 +29,17 @@ SIGNAL_PRESSURE_FILE = os.path.join(COBRA_STATE_DIR, "cobra-signals.json")
 
 
 def _find_scan_file(instance_workspace, filename):
-    """Resolve a scan file: per-instance workspace first, shared workspace fallback."""
+    """Resolve a scan file across standard locations.
+
+    Search order: workspace root, history/ subdir (wolf convention),
+    then shared workspace fallback.
+    """
     instance_path = os.path.join(instance_workspace, filename)
     if os.path.exists(instance_path):
         return instance_path
+    history_path = os.path.join(instance_workspace, "history", filename)
+    if os.path.exists(history_path):
+        return history_path
     shared_path = os.path.join(get_shared_workspace(), filename)
     if os.path.exists(shared_path):
         return shared_path
@@ -197,8 +204,8 @@ def analyze_tiger_instance(instance_id, instance_data):
         "positionQuality": {"phase1": 0, "tier1": 0, "tier2plus": 0},
     }
 
-    # --- Read prescreened.json (written by prescreener.py) ---
-    prescreened_path = _find_scan_file(state_dir, "prescreened.json")
+    # --- Read prescreened.json (written by prescreener.py to workspace root) ---
+    prescreened_path = _find_scan_file(workspace, "prescreened.json")
     prescreened = load_json_safe(prescreened_path)
     if isinstance(prescreened, dict):
         candidates = prescreened.get("candidates", prescreened.get("results", []))
