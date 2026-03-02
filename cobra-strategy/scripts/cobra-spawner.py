@@ -330,7 +330,10 @@ def spawn_wolf(budget, dsl_preset="aggressive", name=None, config=None,
         instance_workspace,
     )
 
-    # Build the sessions_spawn instruction for the agent to execute
+    # Build the sessions_spawn instruction for the agent to execute.
+    # sessions_spawn returns {status, runId, childSessionKey} — the agent
+    # should save childSessionKey into the instance file so sessions_send
+    # can target the subagent directly without a sessions_list lookup.
     spawn_instruction = {
         "tool": "sessions_spawn",
         "params": {
@@ -341,10 +344,12 @@ def spawn_wolf(budget, dsl_preset="aggressive", name=None, config=None,
             "mode": "session",
             "runTimeoutSeconds": 0,
         },
+        "_saveChildSessionKey": {
+            "file": os.path.join(SPAWNED_DIR, f"{instance_id}.json"),
+            "field": "childSessionKey",
+        },
     }
 
-    # Also generate crons for work that benefits from scheduled execution
-    # These crons send messages to the subagent session via sessions_send
     cron_payloads = _build_wolf_wake_crons(instance_id, mid_model)
 
     instance_data = {
@@ -480,6 +485,10 @@ def spawn_tiger(budget, goal_pct=5, max_slots=3, name=None, config=None,
             "mode": "session",
             "runTimeoutSeconds": 0,
         },
+        "_saveChildSessionKey": {
+            "file": os.path.join(SPAWNED_DIR, f"{instance_id}.json"),
+            "field": "childSessionKey",
+        },
     }
 
     cron_payloads = _build_tiger_wake_crons(instance_id, mid_model)
@@ -558,25 +567,39 @@ def _build_tiger_wake_crons(instance_id, mid_model):
     return crons
 
 
-def build_kill_message(instance_id, reason):
-    """Build a sessions_send message to tell a subagent to self-terminate.
+def build_kill_message(instance_id, reason, session_key=None):
+    """Build a sessions_send instruction to tell a subagent to self-terminate.
 
     The subagent closes all its positions and announces results back.
+
+    If session_key is known (saved from sessions_spawn result), use it
+    directly. Otherwise the agent must resolve the label to a sessionKey
+    via sessions_list first.
     """
-    return {
+    msg = {
         "tool": "sessions_send",
-        "targetLabel": instance_id,
-        "message": (
-            f"COBRA KILL ORDER for {instance_id}.\n"
-            f"Reason: {reason}\n\n"
-            f"IMMEDIATELY:\n"
-            f"1. Close ALL open positions on your wallet\n"
-            f"2. Set all DSL states to active: false\n"
-            f"3. Report final PnL and positions closed\n"
-            f"4. Announce your final status back to COBRA\n\n"
-            f"This is non-negotiable. Execute now."
-        ),
+        "subagentLabel": instance_id,
+        "params": {
+            "message": (
+                f"COBRA KILL ORDER for {instance_id}.\n"
+                f"Reason: {reason}\n\n"
+                f"IMMEDIATELY:\n"
+                f"1. Close ALL open positions on your wallet\n"
+                f"2. Set all DSL states to active: false\n"
+                f"3. Report final PnL and positions closed\n"
+                f"4. Announce your final status back to COBRA\n\n"
+                f"This is non-negotiable. Execute now."
+            ),
+        },
     }
+    if session_key:
+        msg["params"]["sessionKey"] = session_key
+    else:
+        msg["_note"] = (
+            "sessionKey unknown — resolve subagentLabel to sessionKey "
+            "via sessions_list, then call sessions_send with that sessionKey."
+        )
+    return msg
 
 
 def _close_positions_via_clearinghouse(wallet, instance_id, itype):
@@ -704,7 +727,9 @@ def kill_instance(instance_id, reason="brain_decision"):
     instance_data["recoveredAmount"] = recovered_amount
     save_spawned_instance(instance_id, instance_data)
 
-    kill_msg = build_kill_message(instance_id, reason)
+    kill_msg = build_kill_message(
+        instance_id, reason,
+        session_key=instance_data.get("childSessionKey"))
 
     return {
         "success": True,
@@ -724,23 +749,37 @@ def kill_instance(instance_id, reason="brain_decision"):
     }
 
 
-def build_regime_update_message(instance_id, regime, allocation):
-    """Build a sessions_send message to update a subagent about regime change."""
+def build_regime_update_message(instance_id, regime, allocation, session_key=None):
+    """Build a sessions_send instruction to update a subagent about regime change.
+
+    Same resolution pattern as build_kill_message: uses session_key directly
+    when available, otherwise the agent resolves the label via sessions_list.
+    """
     leverage_guidance = {
         "TRENDING": "Leverage up to 10x is appropriate for strong trends.",
         "RANGING": "Reduce leverage to 5-7x. Be more selective with entries.",
         "VOLATILE": "MAXIMUM CAUTION — reduce leverage to 3-5x, tighten stops, reduce exposure.",
     }
-    return {
+    msg = {
         "tool": "sessions_send",
-        "targetLabel": instance_id,
-        "message": (
-            f"COBRA REGIME UPDATE: Market regime is now {regime}.\n"
-            f"Allocation targets: WOLF {allocation.get('wolf', 0)}%, "
-            f"TIGER {allocation.get('tiger', 0)}%, Reserve {allocation.get('reserve', 0)}%.\n"
-            f"{leverage_guidance.get(regime, 'Adjust your aggression accordingly.')}"
-        ),
+        "subagentLabel": instance_id,
+        "params": {
+            "message": (
+                f"COBRA REGIME UPDATE: Market regime is now {regime}.\n"
+                f"Allocation targets: WOLF {allocation.get('wolf', 0)}%, "
+                f"TIGER {allocation.get('tiger', 0)}%, Reserve {allocation.get('reserve', 0)}%.\n"
+                f"{leverage_guidance.get(regime, 'Adjust your aggression accordingly.')}"
+            ),
+        },
     }
+    if session_key:
+        msg["params"]["sessionKey"] = session_key
+    else:
+        msg["_note"] = (
+            "sessionKey unknown — resolve subagentLabel to sessionKey "
+            "via sessions_list, then call sessions_send with that sessionKey."
+        )
+    return msg
 
 
 def get_spawn_summary():

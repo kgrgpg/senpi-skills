@@ -240,14 +240,13 @@ summary, no explanation.
 
 | Tool | Used By | Purpose |
 |------|---------|---------|
-| `market_get_asset_data` | cobra-regime.py | BTC candles for regime classification |
-| `market_list_instruments` | cobra-regime.py | OI data for volatility detection |
-| `market_get_prices` | cobra-monitor.py | Current prices for PnL calc |
+| `market_get_asset_data` | cobra-regime.py, cobra-brain.py | BTC candles for regime classification |
 | `strategy_create_custom_strategy` | cobra-spawner.py | Create new wallet for spawned instance |
 | `strategy_top_up` | cobra-spawner.py | Fund spawned instance |
-| `strategy_get_clearinghouse_state` | cobra-monitor.py, cobra-brain.py | Balance + positions per instance |
+| `strategy_get_clearinghouse_state` | cobra-monitor.py, cobra-brain.py, cobra-spawner.py | Balance + positions per instance |
 | `close_position` | cobra-spawner.py | Close positions when killing instance |
-| `account_get_portfolio` | cobra-brain.py | Total portfolio value |
+| `strategy_withdraw` | cobra-spawner.py | Recover funds from killed instance |
+| `strategy_delete` | cobra-spawner.py | Clean up orphaned strategy on funding failure |
 
 ---
 

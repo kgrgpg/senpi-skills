@@ -41,6 +41,20 @@ SIGNAL_PRESSURE_FILE = os.path.join(COBRA_STATE_DIR, "cobra-signals.json")
 _SIGNAL_STALENESS_MINUTES = 10
 _SPAWN_VERIFY_MINUTES = 30
 
+_spawner_cache = None
+
+
+def _get_spawner():
+    """Lazy-load cobra-spawner.py (hyphenated filename requires importlib)."""
+    global _spawner_cache
+    if _spawner_cache is None:
+        spec = importlib.util.spec_from_file_location(
+            "cobra_spawner",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "cobra-spawner.py"))
+        _spawner_cache = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_spawner_cache)
+    return _spawner_cache
+
 
 def _get_regime():
     """Run regime classification inline."""
@@ -223,7 +237,10 @@ def _evaluate_kill_vs_keep(instance_id, instance_data, signal_data, perf_data, c
         if not reasons:
             reasons.append("KEEP: no kill signals detected")
 
-    return {"decision": decision, "reasons": reasons, "score": kill_score}
+    return {
+        "decision": decision, "reasons": reasons,
+        "score": kill_score, "keepScore": keep_score, "netScore": net_score,
+    }
 
 
 def _decide_spawns(regime_data, signal_data, state, config, current_instances):
@@ -280,9 +297,9 @@ def _decide_spawns(regime_data, signal_data, state, config, current_instances):
     tiger_target_budget = total_budget * tiger_target_pct / 100
 
     wolf_allocated = sum(v.get("budget", 0)
-                         for v in current_instances.values() if v.get("type") == "wolf")
+                         for v in countable.values() if v.get("type") == "wolf")
     tiger_allocated = sum(v.get("budget", 0)
-                          for v in current_instances.values() if v.get("type") == "tiger")
+                          for v in countable.values() if v.get("type") == "tiger")
 
     # Spawn WOLF if under-allocated and under limit
     if (wolf_allocated < wolf_target_budget and
@@ -375,7 +392,7 @@ def _retry_kill_pending(instances, config):
             })
             continue
 
-        import cobra_spawner as _spawner
+        _spawner = _get_spawner()
         result = _spawner.kill_instance(iid, reason=f"kill_pending retry #{retries + 1}")
 
         spawn_file = os.path.join(SPAWNED_DIR, f"{iid}.json")
@@ -546,7 +563,7 @@ def run():
 
     # Step 7: Execute kills (close positions via MCP + prepare subagent kill orders)
     if kills:
-        import cobra_spawner as _spawner
+        _spawner = _get_spawner()
         for k in kills:
             result = _spawner.kill_instance(k["instanceId"], reason=k["reason"])
             kill_results.append(result)
@@ -554,7 +571,7 @@ def run():
     # Step 8: Execute spawns (create wallets + prepare subagent spawn instructions)
     spawn_results = []
     if spawns_planned:
-        import cobra_spawner as _spawner
+        _spawner = _get_spawner()
         for sp in spawns_planned:
             if sp["type"] == "wolf":
                 result = _spawner.spawn_wolf(
@@ -581,10 +598,12 @@ def run():
     current_instances = load_spawned_instances()
     subagent_messages = []
     if regime_shifted and regime != "UNKNOWN":
-        import cobra_spawner as _spawner
+        _spawner = _get_spawner()
         allocation = regime_data.get("allocation", {})
         for iid, idata in current_instances.items():
-            msg = _spawner.build_regime_update_message(iid, regime, allocation)
+            msg = _spawner.build_regime_update_message(
+                iid, regime, allocation,
+                session_key=idata.get("childSessionKey"))
             subagent_messages.append(msg)
 
     # Step 11: Update state

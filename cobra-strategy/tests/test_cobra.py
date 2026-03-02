@@ -28,6 +28,34 @@ def _import_hyphenated(name, filepath):
     return mod
 
 
+# Pre-register hyphenated modules so tests don't depend on execution order.
+_import_hyphenated("cobra_spawner", os.path.join(SCRIPTS_DIR, "cobra-spawner.py"))
+_import_hyphenated("cobra_regime", os.path.join(SCRIPTS_DIR, "cobra-regime.py"))
+_import_hyphenated("cobra_signals", os.path.join(SCRIPTS_DIR, "cobra-signals.py"))
+
+
+class TestSpawnerImport(unittest.TestCase):
+    """Verify brain can load the hyphenated cobra-spawner.py."""
+
+    def test_get_spawner_returns_module(self):
+        brain = _import_hyphenated(
+            "cobra_brain", os.path.join(SCRIPTS_DIR, "cobra-brain.py"))
+        # Clear the cache to force a fresh load
+        brain._spawner_cache = None
+        spawner = brain._get_spawner()
+        self.assertTrue(hasattr(spawner, "spawn_wolf"))
+        self.assertTrue(hasattr(spawner, "kill_instance"))
+        self.assertTrue(hasattr(spawner, "build_kill_message"))
+
+    def test_get_spawner_caches(self):
+        brain = _import_hyphenated(
+            "cobra_brain", os.path.join(SCRIPTS_DIR, "cobra-brain.py"))
+        brain._spawner_cache = None
+        s1 = brain._get_spawner()
+        s2 = brain._get_spawner()
+        self.assertIs(s1, s2)
+
+
 class TestCircuitBreaker(unittest.TestCase):
     """Circuit breaker should compare against allocated capital, not totalBudget."""
 
@@ -407,6 +435,52 @@ class TestSpawnDecisions(unittest.TestCase):
         tigers = [s for s in spawns if s["type"] == "tiger"]
         if wolves and tigers:
             self.assertGreater(tigers[0]["budget"], wolves[0]["budget"])
+
+    def test_kill_pending_excluded_from_allocation(self):
+        """kill_pending instances must NOT count toward per-type allocation,
+        so freed capital can be redeployed via new spawns."""
+        brain = self._load_brain()
+        regime = {"regime": "TRENDING", "allocation": {"wolf": 60, "tiger": 25, "reserve": 15}}
+        signal = {"globalSignalPressure": 70}
+        instances = {
+            "wolf-1": {"type": "wolf", "budget": 3000, "status": "active"},
+            "wolf-2": {"type": "wolf", "budget": 3000, "status": "kill_pending"},
+        }
+        spawns = brain._decide_spawns(
+            regime, signal, {}, self._base_config(maxWolves=2), instances)
+        wolf_spawns = [s for s in spawns if s["type"] == "wolf"]
+        self.assertGreater(len(wolf_spawns), 0,
+                           "Should spawn wolf since kill_pending freed a slot")
+
+
+class TestKillVsKeepNetScore(unittest.TestCase):
+    """Net score should be returned for debugging transparency."""
+
+    def _load_brain(self):
+        return _import_hyphenated(
+            "cobra_brain", os.path.join(SCRIPTS_DIR, "cobra-brain.py"))
+
+    def test_net_score_in_result(self):
+        brain = self._load_brain()
+        config = {"killVsKeep": {
+            "signalPressureKillThreshold": 60, "idleHoursBeforeKill": 2,
+            "avgFeePerTrade": 32, "maxDrawdownPct": 20,
+        }}
+        signal_data = {"instances": {"wolf-1": {
+            "signalPressure": 20,
+            "positionQuality": {"phase1": 0, "tier1": 0, "tier2plus": 0},
+        }}}
+        perf_data = {"instances": {"wolf-1": {
+            "accountValue": 5000, "unrealizedPnl": 0, "utilization": 50,
+            "drawdownFromPeak": 0, "tradeStats": {"activePositions": 1},
+        }}}
+        result = brain._evaluate_kill_vs_keep(
+            "wolf-1", {"type": "wolf", "budget": 5000,
+                       "spawnedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")},
+            signal_data, perf_data, config)
+        self.assertIn("netScore", result)
+        self.assertIn("keepScore", result)
+        self.assertEqual(result["netScore"], result["score"] - result["keepScore"])
 
 
 class TestSignalPressureScoring(unittest.TestCase):
@@ -799,6 +873,41 @@ class TestKillFlowMCPFailure(unittest.TestCase):
             self.assertEqual(result["killStatus"], "kill_pending")
         finally:
             self._cleanup_instance("tiger-closefail")
+
+
+class TestSessionKeyInMessages(unittest.TestCase):
+    """sessions_send messages should include sessionKey when available."""
+
+    def _load_spawner(self):
+        return _import_hyphenated(
+            "cobra_spawner", os.path.join(SCRIPTS_DIR, "cobra-spawner.py"))
+
+    def test_kill_message_includes_session_key(self):
+        spawner = self._load_spawner()
+        msg = spawner.build_kill_message("wolf-1", "test", session_key="agent:main:subagent:abc123")
+        self.assertEqual(msg["params"]["sessionKey"], "agent:main:subagent:abc123")
+        self.assertNotIn("_note", msg)
+
+    def test_kill_message_fallback_without_session_key(self):
+        spawner = self._load_spawner()
+        msg = spawner.build_kill_message("wolf-1", "test")
+        self.assertNotIn("sessionKey", msg["params"])
+        self.assertIn("_note", msg)
+        self.assertIn("sessions_list", msg["_note"])
+
+    def test_regime_message_includes_session_key(self):
+        spawner = self._load_spawner()
+        msg = spawner.build_regime_update_message(
+            "wolf-1", "VOLATILE", {"wolf": 40, "tiger": 30, "reserve": 30},
+            session_key="agent:main:subagent:def456")
+        self.assertEqual(msg["params"]["sessionKey"], "agent:main:subagent:def456")
+
+    def test_regime_message_fallback_without_session_key(self):
+        spawner = self._load_spawner()
+        msg = spawner.build_regime_update_message(
+            "wolf-1", "TRENDING", {"wolf": 60, "tiger": 25, "reserve": 15})
+        self.assertNotIn("sessionKey", msg["params"])
+        self.assertIn("_note", msg)
 
 
 if __name__ == "__main__":
