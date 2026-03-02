@@ -400,12 +400,12 @@ class TestSignalPressureScoring(unittest.TestCase):
         self.assertEqual(result["signalPressure"], 25)
 
     def test_tiger_high_confluence(self):
-        """Each scanner with confluence >= 0.65 adds 10 to pressure."""
-        for scanner in ("funding-scanner.json", "compression-scanner.json",
-                        "momentum-scanner.json"):
-            self._write_json(scanner, {"confluence": 0.75})
-        for scanner in ("whale-scanner.json", "volatility-scanner.json"):
-            self._write_json(scanner, {"confluence": 0.3})
+        """Prescreened candidates with score >= 65 count as high-confluence."""
+        candidates = [
+            {"score": 75}, {"score": 80}, {"score": 70},
+            {"score": 40}, {"score": 55},
+        ]
+        self._write_json("prescreened.json", {"candidates": candidates})
         with patch.object(self.signals, "get_instance_workspace", return_value=self.tmpdir), \
              patch.object(self.signals, "get_instance_state_dir", return_value=self.tmpdir):
             result = self.signals.analyze_tiger_instance("tiger-1", {"maxSlots": 3})
@@ -414,12 +414,13 @@ class TestSignalPressureScoring(unittest.TestCase):
 
     def test_tiger_prescreener_density_bonus(self):
         """Density >= 25 adds (density - 15) * 5 to pressure."""
-        candidates = [{"score": 70} for _ in range(30)]
+        candidates = [{"score": 50} for _ in range(30)]
         self._write_json("prescreened.json", {"candidates": candidates})
         with patch.object(self.signals, "get_instance_workspace", return_value=self.tmpdir), \
              patch.object(self.signals, "get_instance_state_dir", return_value=self.tmpdir):
             result = self.signals.analyze_tiger_instance("tiger-1", {"maxSlots": 3})
         self.assertEqual(result["prescreenerDensity"], 30)
+        self.assertEqual(result["highConfluenceCount"], 0)
         self.assertEqual(result["signalPressure"], 75)
 
     def test_pressure_capped_at_100(self):

@@ -156,12 +156,12 @@ Run: `{ws_env} PYTHONUNBUFFERED=1 timeout 180 python3 {scripts}/opportunity-scan
 def _build_tiger_subagent_task(instance_id, scripts, tg, wallet, budget,
                                 max_slots, goal_pct, instance_workspace):
     """Build the comprehensive task description for a TIGER subagent."""
-    ws_env = f"OPENCLAW_WORKSPACE={instance_workspace}"
+    ws_env = f"TIGER_WORKSPACE={instance_workspace}"
     return f"""You are TIGER instance {instance_id}, managed by COBRA.
 
 ## Your Identity
 - Instance ID: {instance_id}
-- Type: TIGER (calculated, multi-scanner entry system)
+- Type: TIGER (calculated, multi-scanner goal-based trading)
 - Wallet: {wallet}
 - Budget: ${budget:.0f}
 - Max Slots: {max_slots}
@@ -170,50 +170,69 @@ def _build_tiger_subagent_task(instance_id, scripts, tg, wallet, budget,
 
 ## Workspace
 Your dedicated workspace: {instance_workspace}
-IMPORTANT: Prefix every script command with `{ws_env}` so outputs are
+IMPORTANT: Prefix every script command with `{ws_env}` so state files are
 written to your isolated directory, not shared with other instances.
 
 ## Your Mission
 You are an autonomous TIGER trading agent. You use 5 independent scanners
-(funding, compression, momentum, whale, volatility) to build confluence
-scores, then enter positions when multiple scanners agree. You operate
-independently in your own session.
+(compression breakout, BTC correlation lag, momentum breakout, mean reversion,
+funding rate arb) to build confluence scores, then enter positions when
+multiple scanners agree. A goal engine adjusts aggression based on performance
+vs target. You operate independently in your own session.
 
 ## Recurring Work (execute on every wake)
 
-### 1. Prescreener (every other wake)
+### 1. OI Tracker (every wake — builds history for scanners)
+Run: `{ws_env} python3 {scripts}/oi-tracker.py`
+- Samples open interest for all prescreened assets
+- Compression and reversion scanners need ~1h of OI history
+
+### 2. Prescreener (every other wake)
 Run: `{ws_env} python3 {scripts}/prescreener.py`
-- Filters universe to top candidates for scanner consumption
+- Scores all ~230 assets in one API call, writes top 30 to prescreened.json
+- All scanners read from this instead of doing their own filtering
 
-### 2. Scanner Battery (run all 5)
-Run each scanner, collect confluence scores:
-- `{ws_env} python3 {scripts}/funding-scanner.py`
-- `{ws_env} python3 {scripts}/compression-scanner.py`
-- `{ws_env} python3 {scripts}/momentum-scanner.py`
-- `{ws_env} python3 {scripts}/whale-scanner.py`
-- `{ws_env} python3 {scripts}/volatility-scanner.py`
+### 3. Scanner Battery (run all 5, act on signals)
+Run each scanner, evaluate outputs for entry signals:
+- `{ws_env} python3 {scripts}/compression-scanner.py` (BB compression breakout)
+- `{ws_env} python3 {scripts}/correlation-scanner.py` (BTC correlation lag)
+- `{ws_env} python3 {scripts}/momentum-scanner.py` (momentum breakout)
+- `{ws_env} python3 {scripts}/reversion-scanner.py` (mean reversion)
+- `{ws_env} python3 {scripts}/funding-scanner.py` (funding rate arbitrage)
 
-### 3. Entry Engine
-Run: `{ws_env} python3 {scripts}/entry-engine.py`
-- Evaluate scanner confluence for {wallet}
-- Max {max_slots} slots, goal +{goal_pct}% on ${budget:.0f}
-- Enter when multiple scanners agree (confluence >= 0.65)
-- Alert {tg} for entries
+For each scanner: if actionable > 0 and confluence >= threshold for current
+aggression level and slots available: enter via create_position on {wallet}.
+Alert {tg} with asset, direction, pattern, confluence score, leverage.
 
-### 4. Position Manager
-Run: `{ws_env} python3 {scripts}/position-manager.py`
-- Manage TP/SL for {wallet}
-- Alert {tg} on closes
+### 4. Goal Engine (every 4th wake — adjusts aggression)
+Run: `{ws_env} python3 {scripts}/goal-engine.py`
+- Compares current balance vs target, adjusts aggression (CONSERVATIVE/NORMAL/ELEVATED/ABORT)
+- Recalculates daily rate needed, updates confluence thresholds
 
-### 5. ROAR Optimizer (every 4th wake)
-Run: `{ws_env} python3 {scripts}/roar-optimizer.py`
-- Adjust aggression based on performance vs goal
+### 5. Risk Guardian (every wake)
+Run: `{ws_env} python3 {scripts}/risk-guardian.py`
+- Enforces daily loss limit, max drawdown, max concurrent positions
+- Can halt trading if limits breached
+- Alert {tg} on critical risk events
+
+### 6. Exit Checker + DSL (every wake)
+Run: `{ws_env} python3 {scripts}/tiger-exit.py`
+- Pattern-specific exit logic (each scanner pattern has its own exit rules)
+Run: `{ws_env} python3 {scripts}/dsl-v4.py`
+- Trailing stop loss management for all active positions
+- Alert {tg} on closes with asset, direction, PnL, close reason
+
+### 7. ROAR Analyst (every 4th wake)
+Run: `{ws_env} python3 {scripts}/roar-analyst.py`
+- Meta-optimizer: analyzes trade history, proposes config changes
+- Outputs proposed changeset for review
 
 ## Rules
-- Calculated entries only — require scanner confluence
-- Respect max slots and goal-based aggression from ROAR
+- Calculated entries only — require scanner confluence above aggression-adjusted threshold
+- Respect max slots and goal-based aggression from Goal Engine
+- Risk Guardian can halt all trading — respect halt state
 - If COBRA sends a KILL order, close all positions immediately and announce results
-- If COBRA sends a REGIME update, adjust strategy and leverage accordingly
+- If COBRA sends a REGIME update, adjust leverage and aggression accordingly
 - Always output structured JSON summaries for COBRA to read
 
 ## VIPER Token Optimization
@@ -504,7 +523,7 @@ def _build_tiger_wake_crons(instance_id, mid_model):
     prefix = f"COBRA/{instance_id}"
     crons = []
 
-    # Scanner + entry wake (every 5 min)
+    # Scanner + risk + exit wake (every 5 min)
     crons.append(generate_cron_payload(
         name=f"{prefix}/Wake-Scan",
         schedule_ms=300000,
@@ -513,9 +532,9 @@ def _build_tiger_wake_crons(instance_id, mid_model):
         mandate=(
             f"COBRA subagent wake: Use sessions_send to send this message to "
             f"subagent '{instance_id}':\n"
-            f'"Run your scanner battery and entry engine now. '
-            f'Check position manager for TP/SL updates. '
-            f'Report any entries, exits, or alerts. If nothing actionable, '
+            f'"Run OI tracker, then scanner battery (compression, correlation, '
+            f'momentum, reversion, funding). Run risk guardian, exit checker, '
+            f'and DSL. Report any entries, exits, or alerts. If nothing actionable, '
             f'reply HEARTBEAT_OK."\n'
             f"If the subagent is not running, reply with "
             f'"SUBAGENT_DOWN: {instance_id}".'
@@ -523,7 +542,7 @@ def _build_tiger_wake_crons(instance_id, mid_model):
         viper_wrap=True,
     ))
 
-    # Prescreener + ROAR wake (every 30 min)
+    # Prescreener + goal engine + ROAR wake (every 30 min)
     crons.append(generate_cron_payload(
         name=f"{prefix}/Wake-Full",
         schedule_ms=1800000,
@@ -532,9 +551,9 @@ def _build_tiger_wake_crons(instance_id, mid_model):
         mandate=(
             f"COBRA subagent wake: Use sessions_send to send this message to "
             f"subagent '{instance_id}':\n"
-            f'"Run FULL cycle: prescreener refresh, all scanners, entry engine, '
-            f'position manager, ROAR optimizer. Send portfolio summary to Telegram. '
-            f'Report all findings."\n'
+            f'"Run FULL cycle: prescreener, OI tracker, all 5 scanners, '
+            f'goal engine, risk guardian, exit checker, DSL, ROAR analyst. '
+            f'Send portfolio summary to Telegram. Report all findings."\n'
             f"If the subagent is not running, reply with "
             f'"SUBAGENT_DOWN: {instance_id}".'
         ),
@@ -590,7 +609,7 @@ def kill_instance(instance_id, reason="brain_decision"):
 
     # Close positions via MCP as a direct action (don't rely solely on subagent)
     close_results = []
-    state_dir = os.path.join(WORKSPACE, "state", instance_id)
+    state_dir = get_instance_state_dir(instance_id, itype)
 
     if itype == "wolf":
         dsl_files = glob.glob(os.path.join(state_dir, "dsl-*.json"))

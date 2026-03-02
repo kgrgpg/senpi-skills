@@ -154,7 +154,15 @@ def analyze_wolf_instance(instance_id, instance_data):
 
 
 def analyze_tiger_instance(instance_id, instance_data):
-    """Analyze signal pressure for a TIGER instance."""
+    """Analyze signal pressure for a TIGER instance.
+
+    TIGER scanners output to stdout (not to individual JSON files).
+    Signal pressure is derived from:
+    - prescreened.json: candidate density (market richness)
+    - tiger-state.json: active positions, slots, aggression, halt state
+    - trade-log.json: per-pattern win rates, recent outcomes
+    - dsl-{asset}.json: position quality (same format as WOLF DSL)
+    """
     workspace = get_instance_workspace(instance_id, "tiger")
     state_dir = get_instance_state_dir(instance_id, "tiger")
 
@@ -167,11 +175,13 @@ def analyze_tiger_instance(instance_id, instance_data):
         "slotsUsed": 0,
         "slotsMax": instance_data.get("maxSlots", 3),
         "aggression": "NORMAL",
+        "halted": False,
         "recentWinRate": 0,
+        "positionQuality": {"phase1": 0, "tier1": 0, "tier2plus": 0},
     }
 
-    # --- Read prescreened.json ---
-    prescreened_path = _find_scan_file(workspace, "prescreened.json")
+    # --- Read prescreened.json (written by prescreener.py) ---
+    prescreened_path = _find_scan_file(state_dir, "prescreened.json")
     prescreened = load_json_safe(prescreened_path)
     if isinstance(prescreened, dict):
         candidates = prescreened.get("candidates", prescreened.get("results", []))
@@ -181,23 +191,34 @@ def analyze_tiger_instance(instance_id, instance_data):
                       for c in candidates if c.get("score") or c.get("totalScore")]
             if scores:
                 result["avgPrescreenerScore"] = round(sum(scores) / len(scores), 1)
+                result["highConfluenceCount"] = sum(1 for s in scores if s >= 65)
     elif isinstance(prescreened, list):
         result["prescreenerDensity"] = len(prescreened)
         scores = [float(c.get("score", c.get("totalScore", 0)))
                   for c in prescreened if c.get("score") or c.get("totalScore")]
         if scores:
             result["avgPrescreenerScore"] = round(sum(scores) / len(scores), 1)
+            result["highConfluenceCount"] = sum(1 for s in scores if s >= 65)
 
-    # --- Read tiger-state.json ---
-    tiger_state_path = _find_scan_file(workspace, "tiger-state.json")
+    # --- Read tiger-state.json (written by tiger_config.save_state) ---
+    tiger_state_path = _find_scan_file(state_dir, "tiger-state.json")
     tiger_state = load_json_safe(tiger_state_path)
     if tiger_state:
-        result["slotsUsed"] = tiger_state.get("activePositions", 0)
-        result["slotsMax"] = tiger_state.get("maxSlots", result["slotsMax"])
+        active_positions = tiger_state.get("activePositions", {})
+        if isinstance(active_positions, dict):
+            result["slotsUsed"] = len(active_positions)
+        elif isinstance(active_positions, (int, float)):
+            result["slotsUsed"] = int(active_positions)
         result["aggression"] = tiger_state.get("aggression", "NORMAL")
+        safety = tiger_state.get("safety", {})
+        result["halted"] = safety.get("halted", False)
+        total_trades = tiger_state.get("totalTrades", 0)
+        total_wins = tiger_state.get("totalWins", 0)
+        if total_trades > 0:
+            result["recentWinRate"] = round(total_wins / total_trades, 2)
 
-    # --- Read trade-log.json for recent win rate ---
-    trade_log_path = _find_scan_file(workspace, "trade-log.json")
+    # --- Read trade-log.json for per-pattern win rates ---
+    trade_log_path = _find_scan_file(state_dir, "trade-log.json")
     trade_log = load_json_safe(trade_log_path)
     if isinstance(trade_log, list) and trade_log:
         recent = trade_log[-20:]
@@ -215,26 +236,33 @@ def analyze_tiger_instance(instance_id, instance_data):
             if total_trades > 0:
                 result["recentWinRate"] = round(total_wins / total_trades, 2)
 
-    # --- Count high-confluence scanner outputs ---
-    for scanner_file in ["funding-scanner.json", "compression-scanner.json",
-                         "momentum-scanner.json", "whale-scanner.json",
-                         "volatility-scanner.json"]:
-        scanner_path = _find_scan_file(workspace, scanner_file)
-        scanner_data = load_json_safe(scanner_path)
-        if scanner_data:
-            confluence = scanner_data.get("confluence", 0)
-            if isinstance(confluence, (int, float)) and confluence >= 0.65:
-                result["highConfluenceCount"] += 1
+    # --- Read DSL state files for position quality (same format as WOLF) ---
+    dsl_pattern = os.path.join(state_dir, "dsl-*.json")
+    dsl_files = glob.glob(dsl_pattern)
+    for dsl_path in dsl_files:
+        state = load_json_safe(dsl_path)
+        if not state or not state.get("active"):
+            continue
+        tier_idx = state.get("currentTierIndex")
+        phase = state.get("phase", 1)
+        if phase == 1 or tier_idx is None:
+            result["positionQuality"]["phase1"] += 1
+        elif tier_idx == 0:
+            result["positionQuality"]["tier1"] += 1
+        else:
+            result["positionQuality"]["tier2plus"] += 1
 
     # --- Compute signal pressure score ---
     pressure = 0
     pressure += result["highConfluenceCount"] * 10
     if result["prescreenerDensity"] >= 25:
         pressure += (result["prescreenerDensity"] - 15) * 5
-    if result["slotsUsed"] >= result["slotsMax"] and result["highConfluenceCount"] > 0:
+    if result["slotsUsed"] >= result["slotsMax"] and result["prescreenerDensity"] > 0:
         pressure += 15
     if result["aggression"] in ("ELEVATED", "ABORT"):
         pressure += 10
+    if result["halted"]:
+        pressure = max(pressure - 20, 0)
     result["signalPressure"] = min(100, pressure)
 
     return result

@@ -35,12 +35,22 @@ WOLF parameters are auto-calculated from budget:
 | $10,000–$29,999 | 4 | 30% of budget | 10x |
 | $30,000+ | 5 | 30% of budget | 10x |
 
+WOLF scripts (from wolf-strategy):
+`emerging-movers.py`, `dsl-combined.py`, `sm-flip-check.py`,
+`wolf-monitor.py`, `job-health-check.py`, `opportunity-scan-v6.py`
+
 TIGER parameters:
 
 | Parameter | Default | Notes |
 |-----------|---------|-------|
 | maxSlots | 3 | Configurable per spawn |
 | goalPct | 5% (TRENDING) / 3% (RANGING) | Regime-dependent |
+
+TIGER scripts (from tiger):
+`prescreener.py`, `oi-tracker.py`, `compression-scanner.py`,
+`correlation-scanner.py`, `momentum-scanner.py`, `reversion-scanner.py`,
+`funding-scanner.py`, `goal-engine.py`, `risk-guardian.py`,
+`tiger-exit.py`, `dsl-v4.py`, `roar-analyst.py`
 
 ### 4. Subagent Creation (via OpenClaw sessions_spawn)
 

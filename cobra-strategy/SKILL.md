@@ -117,15 +117,15 @@ WOLF and TIGER screeners produce rich signal data that goes unused when capital 
 
 ### What COBRA reads from TIGER instances
 - `prescreened.json` — candidate density and scores (market richness indicator)
-- `tiger-state.json` — active positions vs slots, aggression level
+- `tiger-state.json` — active positions vs slots, aggression level, halt state
 - `trade-log.json` — per-pattern win rates, recent outcomes
-- Scanner outputs — confluence scores (0.65+ = strong signal)
+- `dsl-{asset}.json` — position quality (same DSL format as WOLF)
 
 ### Signal Pressure Score (0-100)
 
 **WOLF:** `missedFirstJumps × 15 + missedOpportunities × 8 + 10 if slots full`
 
-**TIGER:** `highConfluence × 10 + (density - 15) × 5 if ≥ 25 + 15 if slots full`
+**TIGER:** `highScoreCandidates × 10 + (density - 15) × 5 if ≥ 25 + 15 if slots full + 10 if ELEVATED/ABORT - 20 if halted`
 
 **Pressure > 60 + slots full = COBRA should spawn more capacity or kill an underperformer.**
 
