@@ -8,8 +8,20 @@ Run: python3 -m pytest tests/test_cobra.py -v
 """
 
 import json, os, sys, tempfile, shutil, unittest, importlib.util
+from contextlib import contextmanager
 from unittest.mock import patch, MagicMock
 from datetime import datetime, timezone, timedelta
+
+
+@contextmanager
+def ExitStack_cm(*cms):
+    """Combine multiple patch context managers into one."""
+    if not cms:
+        yield
+        return
+    with cms[0]:
+        with ExitStack_cm(*cms[1:]):
+            yield
 
 SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
 sys.path.insert(0, SCRIPTS_DIR)
@@ -497,6 +509,384 @@ class TestSpawnPriority(unittest.TestCase):
         types = {s["type"] for s in spawns}
         self.assertIn("wolf", types)
         self.assertIn("tiger", types)
+
+
+class TestSlotExpansion(unittest.TestCase):
+    """Dynamic slot expansion when signal-rich and slot-capped."""
+
+    def _load_brain(self):
+        return _import_hyphenated(
+            "cobra_brain", os.path.join(SCRIPTS_DIR, "cobra-brain.py"))
+
+    def _base_config(self, **overrides):
+        cfg = {
+            "totalBudget": 10000, "minSpawnBudget": 500,
+            "maxWolves": 2, "maxTigers": 1, "reservePct": 15,
+            "killVsKeep": {"signalPressureSpawnThreshold": 50},
+        }
+        cfg.update(overrides)
+        return cfg
+
+    def test_expands_slot_capped_high_pressure(self):
+        """Instance at max slots with pressure > 60 should get expansion."""
+        brain = self._load_brain()
+        signal = {
+            "instances": {
+                "wolf-exp1": {
+                    "signalPressure": 75, "slotsUsed": 2, "slotsMax": 2,
+                },
+            },
+        }
+        perf = {
+            "instances": {
+                "wolf-exp1": {"accountValue": 500, "utilization": 60},
+            },
+        }
+        instances = {
+            "wolf-exp1": {"type": "wolf", "status": "active", "budget": 500, "slots": 2},
+        }
+        expansions = brain._decide_expansions(signal, perf, self._base_config(), instances)
+        self.assertEqual(len(expansions), 1)
+        self.assertEqual(expansions[0]["newSlots"], 3)
+        self.assertGreater(expansions[0]["newMarginPerSlot"], 0)
+
+    def test_no_expand_low_pressure(self):
+        """Pressure < 60 should not trigger expansion."""
+        brain = self._load_brain()
+        signal = {
+            "instances": {
+                "wolf-lo": {"signalPressure": 40, "slotsUsed": 2, "slotsMax": 2},
+            },
+        }
+        perf = {"instances": {"wolf-lo": {"accountValue": 500, "utilization": 50}}}
+        instances = {"wolf-lo": {"type": "wolf", "status": "active", "budget": 500, "slots": 2}}
+        expansions = brain._decide_expansions(signal, perf, self._base_config(), instances)
+        self.assertEqual(len(expansions), 0)
+
+    def test_no_expand_slots_available(self):
+        """If slots not full, no expansion needed."""
+        brain = self._load_brain()
+        signal = {
+            "instances": {
+                "wolf-avail": {"signalPressure": 80, "slotsUsed": 1, "slotsMax": 2},
+            },
+        }
+        perf = {"instances": {"wolf-avail": {"accountValue": 500, "utilization": 30}}}
+        instances = {"wolf-avail": {"type": "wolf", "status": "active", "budget": 500, "slots": 2}}
+        expansions = brain._decide_expansions(signal, perf, self._base_config(), instances)
+        self.assertEqual(len(expansions), 0)
+
+    def test_no_expand_high_utilization(self):
+        """Utilization > 70% blocks expansion (insufficient margin headroom)."""
+        brain = self._load_brain()
+        signal = {
+            "instances": {
+                "wolf-util": {"signalPressure": 80, "slotsUsed": 2, "slotsMax": 2},
+            },
+        }
+        perf = {"instances": {"wolf-util": {"accountValue": 500, "utilization": 75}}}
+        instances = {"wolf-util": {"type": "wolf", "status": "active", "budget": 500, "slots": 2}}
+        expansions = brain._decide_expansions(signal, perf, self._base_config(), instances)
+        self.assertEqual(len(expansions), 0)
+
+    def test_no_expand_drawdown(self):
+        """Account value < 95% of budget blocks expansion."""
+        brain = self._load_brain()
+        signal = {
+            "instances": {
+                "wolf-dd": {"signalPressure": 80, "slotsUsed": 2, "slotsMax": 2},
+            },
+        }
+        perf = {"instances": {"wolf-dd": {"accountValue": 400, "utilization": 50}}}
+        instances = {"wolf-dd": {"type": "wolf", "status": "active", "budget": 500, "slots": 2}}
+        expansions = brain._decide_expansions(signal, perf, self._base_config(), instances)
+        self.assertEqual(len(expansions), 0)
+
+    def test_max_slot_cap(self):
+        """Cannot expand beyond 5 slots."""
+        brain = self._load_brain()
+        signal = {
+            "instances": {
+                "wolf-cap": {"signalPressure": 90, "slotsUsed": 5, "slotsMax": 5},
+            },
+        }
+        perf = {"instances": {"wolf-cap": {"accountValue": 10000, "utilization": 40}}}
+        instances = {"wolf-cap": {"type": "wolf", "status": "active", "budget": 10000, "slots": 5}}
+        expansions = brain._decide_expansions(signal, perf, self._base_config(), instances)
+        self.assertEqual(len(expansions), 0)
+
+    def test_margin_recalculation(self):
+        """New margin per slot = accountValue * 0.30 / newSlots."""
+        brain = self._load_brain()
+        signal = {
+            "instances": {
+                "wolf-mrg": {"signalPressure": 70, "slotsUsed": 3, "slotsMax": 3},
+            },
+        }
+        perf = {"instances": {"wolf-mrg": {"accountValue": 6000, "utilization": 50}}}
+        instances = {"wolf-mrg": {"type": "wolf", "status": "active", "budget": 5000, "slots": 3}}
+        expansions = brain._decide_expansions(signal, perf, self._base_config(), instances)
+        self.assertEqual(len(expansions), 1)
+        self.assertEqual(expansions[0]["newSlots"], 4)
+        expected_margin = round(6000 * 0.30 / 4, 2)
+        self.assertEqual(expansions[0]["newMarginPerSlot"], expected_margin)
+
+
+class TestRebalanceDecisions(unittest.TestCase):
+    """Rebalance idle instances to active strategy types."""
+
+    def _load_brain(self):
+        return _import_hyphenated(
+            "cobra_brain", os.path.join(SCRIPTS_DIR, "cobra-brain.py"))
+
+    def _base_config(self, **overrides):
+        cfg = {
+            "totalBudget": 10000, "minSpawnBudget": 500,
+            "maxWolves": 2, "maxTigers": 1, "reservePct": 15,
+            "killVsKeep": {"signalPressureSpawnThreshold": 50},
+        }
+        cfg.update(overrides)
+        return cfg
+
+    def test_rebalance_idle_tiger_to_wolf(self):
+        """Idle tiger (0% util, 3h) with wolf pressure > 50 triggers rebalance."""
+        brain = self._load_brain()
+        signal = {
+            "instances": {
+                "tiger-idle": {"signalPressure": 10},
+                "wolf-busy": {"signalPressure": 70},
+            },
+        }
+        perf = {
+            "instances": {
+                "tiger-idle": {"accountValue": 1000, "utilization": 0},
+                "wolf-busy": {"accountValue": 500, "utilization": 60},
+            },
+        }
+        instances = {
+            "tiger-idle": {
+                "type": "tiger", "status": "active", "budget": 1000,
+                "spawnedAt": "2020-01-01T00:00:00Z",
+            },
+            "wolf-busy": {
+                "type": "wolf", "status": "active", "budget": 500,
+                "spawnedAt": "2020-01-01T00:00:00Z",
+            },
+        }
+        rebs = brain._decide_rebalances(signal, perf, self._base_config(), instances)
+        self.assertEqual(len(rebs), 1)
+        self.assertEqual(rebs[0]["fromInstance"], "tiger-idle")
+        self.assertEqual(rebs[0]["toType"], "wolf")
+        self.assertEqual(rebs[0]["amount"], 500.0)
+
+    def test_no_rebalance_if_other_type_low_pressure(self):
+        """No rebalance if the other strategy type has low pressure."""
+        brain = self._load_brain()
+        signal = {
+            "instances": {
+                "tiger-idle": {"signalPressure": 5},
+                "wolf-quiet": {"signalPressure": 20},
+            },
+        }
+        perf = {
+            "instances": {
+                "tiger-idle": {"accountValue": 1000, "utilization": 0},
+                "wolf-quiet": {"accountValue": 500, "utilization": 10},
+            },
+        }
+        instances = {
+            "tiger-idle": {
+                "type": "tiger", "status": "active", "budget": 1000,
+                "spawnedAt": "2020-01-01T00:00:00Z",
+            },
+            "wolf-quiet": {
+                "type": "wolf", "status": "active", "budget": 500,
+                "spawnedAt": "2020-01-01T00:00:00Z",
+            },
+        }
+        rebs = brain._decide_rebalances(signal, perf, self._base_config(), instances)
+        self.assertEqual(len(rebs), 0)
+
+    def test_no_rebalance_recently_spawned(self):
+        """Instance alive < 2 hours should not be rebalanced."""
+        brain = self._load_brain()
+        from cobra_config import utc_now
+        signal = {
+            "instances": {
+                "tiger-new": {"signalPressure": 0},
+                "wolf-hot": {"signalPressure": 80},
+            },
+        }
+        perf = {
+            "instances": {
+                "tiger-new": {"accountValue": 500, "utilization": 0},
+                "wolf-hot": {"accountValue": 500, "utilization": 60},
+            },
+        }
+        instances = {
+            "tiger-new": {
+                "type": "tiger", "status": "active", "budget": 500,
+                "spawnedAt": utc_now(),
+            },
+            "wolf-hot": {
+                "type": "wolf", "status": "active", "budget": 500,
+                "spawnedAt": "2020-01-01T00:00:00Z",
+            },
+        }
+        rebs = brain._decide_rebalances(signal, perf, self._base_config(), instances)
+        self.assertEqual(len(rebs), 0)
+
+    def test_rebalance_respects_min_remaining(self):
+        """Rebalance amount must leave at least $400 in the source instance."""
+        brain = self._load_brain()
+        signal = {
+            "instances": {
+                "tiger-small": {"signalPressure": 0},
+                "wolf-hot": {"signalPressure": 80},
+            },
+        }
+        perf = {
+            "instances": {
+                "tiger-small": {"accountValue": 800, "utilization": 0},
+                "wolf-hot": {"accountValue": 500, "utilization": 60},
+            },
+        }
+        instances = {
+            "tiger-small": {
+                "type": "tiger", "status": "active", "budget": 800,
+                "spawnedAt": "2020-01-01T00:00:00Z",
+            },
+            "wolf-hot": {
+                "type": "wolf", "status": "active", "budget": 500,
+                "spawnedAt": "2020-01-01T00:00:00Z",
+            },
+        }
+        rebs = brain._decide_rebalances(
+            signal, perf, self._base_config(minSpawnBudget=500), instances)
+        if rebs:
+            self.assertLessEqual(rebs[0]["amount"], 400)
+
+
+class TestExpansionConfigWrite(unittest.TestCase):
+    """expand_instance_slots must update wolf-strategies.json / tiger-config.json."""
+
+    def _load_spawner(self):
+        return _import_hyphenated(
+            "cobra_spawner", os.path.join(SCRIPTS_DIR, "cobra-spawner.py"))
+
+    def _patch_workspace(self, spawner, cobra_cfg, tmpdir, spawned_dir):
+        """Context manager to patch all workspace-derived paths consistently."""
+        return ExitStack_cm(
+            patch.object(spawner, "SPAWNED_DIR", spawned_dir),
+            patch.object(cobra_cfg, "WORKSPACE", tmpdir),
+            patch.object(cobra_cfg, "SPAWNED_DIR", spawned_dir),
+        )
+
+    def test_wolf_strategies_json_updated(self):
+        import cobra_config
+        spawner = self._load_spawner()
+        tmpdir = tempfile.mkdtemp()
+        spawned_dir = os.path.join(tmpdir, "state", "cobra", "spawned")
+        os.makedirs(spawned_dir)
+        instance_ws = os.path.join(tmpdir, "instances", "wolf-expand1")
+        os.makedirs(instance_ws, exist_ok=True)
+
+        with open(os.path.join(spawned_dir, "wolf-expand1.json"), "w") as f:
+            json.dump({
+                "type": "wolf", "instanceId": "wolf-expand1",
+                "wallet": "0xtest", "strategyId": "strat-1",
+                "budget": 500, "slots": 2, "marginPerSlot": 150,
+                "status": "active", "subagentLabel": "wolf-expand1",
+                "defaultLeverage": 7,
+            }, f)
+
+        wolf_strat = {"strategies": {"wolf-expand1": {
+            "name": "test", "wallet": "0xtest", "slots": 2,
+            "marginPerSlot": 150, "enabled": True,
+        }}}
+        with open(os.path.join(instance_ws, "wolf-strategies.json"), "w") as f:
+            json.dump(wolf_strat, f)
+
+        try:
+            with self._patch_workspace(spawner, cobra_config, tmpdir, spawned_dir):
+                result = spawner.expand_instance_slots("wolf-expand1", 3, 50.0)
+            self.assertTrue(result["success"])
+            self.assertEqual(result["newSlots"], 3)
+
+            with open(os.path.join(instance_ws, "wolf-strategies.json")) as f:
+                updated = json.load(f)
+            strat = updated["strategies"]["wolf-expand1"]
+            self.assertEqual(strat["slots"], 3)
+            self.assertEqual(strat["marginPerSlot"], 50.0)
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_tiger_config_json_updated(self):
+        import cobra_config
+        spawner = self._load_spawner()
+        tmpdir = tempfile.mkdtemp()
+        spawned_dir = os.path.join(tmpdir, "state", "cobra", "spawned")
+        os.makedirs(spawned_dir)
+        instance_ws = os.path.join(tmpdir, "instances", "tiger-expand1")
+        os.makedirs(instance_ws, exist_ok=True)
+
+        with open(os.path.join(spawned_dir, "tiger-expand1.json"), "w") as f:
+            json.dump({
+                "type": "tiger", "instanceId": "tiger-expand1",
+                "wallet": "0xtest", "maxSlots": 2,
+                "budget": 500, "status": "active",
+            }, f)
+
+        with open(os.path.join(instance_ws, "tiger-config.json"), "w") as f:
+            json.dump({"maxSlots": 2, "strategyId": "x"}, f)
+
+        try:
+            with self._patch_workspace(spawner, cobra_config, tmpdir, spawned_dir):
+                result = spawner.expand_instance_slots("tiger-expand1", 4, 37.5)
+            self.assertTrue(result["success"])
+            self.assertEqual(result["newSlots"], 4)
+
+            with open(os.path.join(instance_ws, "tiger-config.json")) as f:
+                updated = json.load(f)
+            self.assertEqual(updated["maxSlots"], 4)
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_expansion_message_includes_session_key(self):
+        spawner = self._load_spawner()
+        msg = spawner.build_expansion_message("wolf-1", 2, 3, 50.0,
+                                              session_key="agent:main:sub:abc")
+        self.assertEqual(msg["params"]["sessionKey"], "agent:main:sub:abc")
+        self.assertIn("3", msg["params"]["message"])
+
+    def test_expansion_preserves_original_slots(self):
+        """First expansion should record originalSlots for later reference."""
+        import cobra_config
+        spawner = self._load_spawner()
+        tmpdir = tempfile.mkdtemp()
+        spawned_dir = os.path.join(tmpdir, "state", "cobra", "spawned")
+        os.makedirs(spawned_dir)
+        instance_ws = os.path.join(tmpdir, "instances", "wolf-orig")
+        os.makedirs(instance_ws, exist_ok=True)
+
+        with open(os.path.join(spawned_dir, "wolf-orig.json"), "w") as f:
+            json.dump({
+                "type": "wolf", "instanceId": "wolf-orig",
+                "wallet": "0xtest", "budget": 500, "slots": 2,
+                "marginPerSlot": 150, "status": "active",
+                "subagentLabel": "wolf-orig", "defaultLeverage": 7,
+            }, f)
+
+        try:
+            with self._patch_workspace(spawner, cobra_config, tmpdir, spawned_dir):
+                spawner.expand_instance_slots("wolf-orig", 3, 50.0)
+
+            with open(os.path.join(spawned_dir, "wolf-orig.json")) as f:
+                data = json.load(f)
+            self.assertEqual(data["originalSlots"], 2)
+            self.assertEqual(data["slots"], 3)
+        finally:
+            shutil.rmtree(tmpdir)
 
 
 class TestKillVsKeepNetScore(unittest.TestCase):

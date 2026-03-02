@@ -352,6 +352,132 @@ def _decide_spawns(regime_data, signal_data, state, config, current_instances):
     return spawns
 
 
+_MAX_EXPANDED_SLOTS = 5
+_EXPANSION_SIGNAL_THRESHOLD = 60
+_EXPANSION_MAX_UTILIZATION = 70
+_EXPANSION_MIN_LIQ_BUFFER = 50
+_REBALANCE_IDLE_HOURS = 2
+_REBALANCE_MIN_UTIL = 5
+_REBALANCE_MIN_REMAINING = 400
+
+
+def _decide_expansions(signal_data, perf_data, config, current_instances):
+    """Decide whether to expand slots on signal-rich, slot-capped instances.
+
+    When an instance is at max slots and reporting high signal pressure
+    (missed opportunities), increase its slot count so the next scan cycle
+    can open additional positions — provided risk gates pass.
+
+    Returns list of {"instanceId", "newSlots", "newMarginPerSlot", "reason"}.
+    """
+    expansions = []
+    for iid, idata in current_instances.items():
+        if idata.get("status", "active") not in ("active", "pending_spawn"):
+            continue
+
+        itype = idata.get("type", "wolf")
+        budget = idata.get("budget", 0)
+        current_slots = idata.get("slots", idata.get("maxSlots", 2))
+
+        if current_slots >= _MAX_EXPANDED_SLOTS:
+            continue
+
+        inst_signals = signal_data.get("instances", {}).get(iid, {})
+        pressure = inst_signals.get("signalPressure", 0)
+        slots_used = inst_signals.get("slotsUsed", 0)
+        slots_max = inst_signals.get("slotsMax", current_slots)
+
+        if pressure < _EXPANSION_SIGNAL_THRESHOLD:
+            continue
+        if slots_used < slots_max:
+            continue
+
+        inst_perf = perf_data.get("instances", {}).get(iid, {})
+        account_value = inst_perf.get("accountValue", 0)
+        utilization = inst_perf.get("utilization", 0)
+
+        if account_value < budget * 0.95:
+            continue
+        if utilization > _EXPANSION_MAX_UTILIZATION:
+            continue
+
+        new_slots = min(current_slots + 1, _MAX_EXPANDED_SLOTS)
+        new_margin = round(account_value * 0.30 / new_slots, 2)
+
+        expansions.append({
+            "instanceId": iid,
+            "type": itype,
+            "currentSlots": current_slots,
+            "newSlots": new_slots,
+            "newMarginPerSlot": new_margin,
+            "reason": (f"Signal pressure {pressure}/100, slots {slots_used}/{slots_max} full, "
+                       f"account ${account_value:.0f} healthy, util {utilization:.0f}%"),
+        })
+
+    return expansions
+
+
+def _decide_rebalances(signal_data, perf_data, config, current_instances):
+    """Decide whether to kill idle instances and respawn capital elsewhere.
+
+    When an instance has near-zero utilization for an extended period while
+    another strategy type has high signal pressure, kill the idle instance
+    and let the freed capital flow into a spawn of the active type.
+
+    Returns list of {"fromInstance", "toType", "amount", "reason"}.
+    """
+    rebalances = []
+    instance_list = list(current_instances.items())
+
+    wolf_pressure = max(
+        (signal_data.get("instances", {}).get(iid, {}).get("signalPressure", 0)
+         for iid, d in instance_list if d.get("type") == "wolf"), default=0)
+    tiger_pressure = max(
+        (signal_data.get("instances", {}).get(iid, {}).get("signalPressure", 0)
+         for iid, d in instance_list if d.get("type") == "tiger"), default=0)
+
+    for iid, idata in instance_list:
+        if idata.get("status", "active") not in ("active",):
+            continue
+
+        itype = idata.get("type", "wolf")
+        budget = idata.get("budget", 0)
+        spawned_at = idata.get("spawnedAt", "")
+
+        inst_perf = perf_data.get("instances", {}).get(iid, {})
+        utilization = inst_perf.get("utilization", 0)
+        account_value = inst_perf.get("accountValue", budget)
+
+        if utilization >= _REBALANCE_MIN_UTIL:
+            continue
+        hours_alive = minutes_since(spawned_at) / 60
+        if hours_alive < _REBALANCE_IDLE_HOURS:
+            continue
+
+        other_pressure = tiger_pressure if itype == "wolf" else wolf_pressure
+        if other_pressure < 50:
+            continue
+
+        rebalance_amount = round(account_value * 0.50, 2)
+        if (account_value - rebalance_amount) < _REBALANCE_MIN_REMAINING:
+            rebalance_amount = max(0, account_value - _REBALANCE_MIN_REMAINING)
+        if rebalance_amount < config.get("minSpawnBudget", 500):
+            continue
+
+        target_type = "tiger" if itype == "wolf" else "wolf"
+        rebalances.append({
+            "fromInstance": iid,
+            "fromType": itype,
+            "toType": target_type,
+            "amount": rebalance_amount,
+            "reason": (f"{iid} idle ({utilization:.0f}% util for {hours_alive:.1f}h), "
+                       f"{target_type} pressure={other_pressure}, "
+                       f"rebalancing ${rebalance_amount:.0f}"),
+        })
+
+    return rebalances
+
+
 def _check_portfolio_circuit_breaker(config, perf_data, instances):
     """Return True if portfolio-level drawdown exceeds threshold.
 
@@ -534,6 +660,7 @@ def run():
     actions = []
     kills = list(re_kills)
     spawns_planned = []
+    expansions_planned = []
 
     for r in kill_pending_results:
         actions.append(f"KILL_PENDING {r['instanceId']}: {r['action']} — {r.get('message', '')}")
@@ -566,6 +693,24 @@ def run():
                     "score": kvk_result["score"],
                 })
 
+        # Step 5b: Slot expansion on signal-rich, slot-capped instances
+        expansions_planned = _decide_expansions(
+            signal_data, perf_data, config, instances)
+        for exp in expansions_planned:
+            actions.append(
+                f"EXPAND {exp['instanceId']}: "
+                f"{exp['currentSlots']}->{exp['newSlots']} slots, {exp['reason']}")
+
+        # Step 5c: Rebalance idle capital to active strategy types
+        rebalances_planned = _decide_rebalances(
+            signal_data, perf_data, config, instances)
+        for reb in rebalances_planned:
+            kills.append({
+                "instanceId": reb["fromInstance"],
+                "reason": f"rebalance: {reb['reason']}",
+            })
+            actions.append(f"REBALANCE {reb['fromInstance']} -> {reb['toType']}: {reb['reason']}")
+
         # Step 6: Spawn decisions — remove killed instances so freed capital is visible
         surviving_instances = {
             iid: idata for iid, idata in instances.items()
@@ -574,6 +719,16 @@ def run():
 
         spawns_planned = _decide_spawns(
             regime_data, signal_data, state, config, surviving_instances)
+
+        # Inject rebalance spawns (target type with freed capital)
+        for reb in rebalances_planned:
+            spawns_planned.append({
+                "type": reb["toType"],
+                "budget": reb["amount"],
+                "dslPreset": "aggressive" if regime == "TRENDING" else "conservative",
+                "goalPct": 5 if regime in ("TRENDING", "VOLATILE") else 3,
+                "reason": f"rebalance from {reb['fromInstance']}",
+            })
 
     # Collect kill results from kill_pending retries
     kill_results = [r["result"] for r in kill_pending_results
@@ -585,6 +740,15 @@ def run():
         for k in kills:
             result = _spawner.kill_instance(k["instanceId"], reason=k["reason"])
             kill_results.append(result)
+
+    # Step 7b: Execute slot expansions
+    expansion_results = []
+    if expansions_planned:
+        _spawner = _get_spawner()
+        for exp in expansions_planned:
+            result = _spawner.expand_instance_slots(
+                exp["instanceId"], exp["newSlots"], exp["newMarginPerSlot"])
+            expansion_results.append(result)
 
     # Step 8: Execute spawns (create wallets + prepare subagent spawn instructions)
     spawn_results = []
@@ -636,6 +800,7 @@ def run():
     state["lastDecision"] = {
         "kills": len(kills),
         "spawns": len(spawns_planned),
+        "expansions": len(expansion_results),
         "actions": actions[:10],
         "portfolioBreakerTripped": portfolio_breaker_tripped,
     }
@@ -662,8 +827,16 @@ def run():
     if spawn_results:
         successful = [s for s in spawn_results if s.get("success")]
         summary_parts.append(f"Spawned: {len(successful)} new instances")
+    if expansion_results:
+        expanded = [e for e in expansion_results if e.get("success")]
+        summary_parts.append(f"Expanded: {len(expanded)} instances")
     if regime_shifted:
         summary_parts.append(f"REGIME SHIFT: {prev_regime} -> {regime}")
+
+    # Collect expansion messages for subagents
+    for er in expansion_results:
+        if er.get("success") and er.get("expansionMessage"):
+            subagent_messages.append(er["expansionMessage"])
 
     # Collect sessions_spawn instructions (from spawns)
     subagent_spawns = []
@@ -705,6 +878,7 @@ def run():
         "portfolioBreakerTripped": portfolio_breaker_tripped,
         "decisions": actions,
         "kills": kill_results,
+        "expansions": expansion_results,
         "spawns": spawn_results,
         "subagentSpawns": subagent_spawns,
         "subagentKills": subagent_kills,
@@ -714,9 +888,9 @@ def run():
         "stuckInstances": stuck_alerts,
         "verifyWarnings": verify_warnings,
         "summary": " | ".join(summary_parts),
-        "actionable": 1 if (kills or spawn_results or regime_shifted
-                            or portfolio_breaker_tripped or stuck_alerts
-                            or verify_warnings) else 0,
+        "actionable": 1 if (kills or spawn_results or expansion_results
+                            or regime_shifted or portfolio_breaker_tripped
+                            or stuck_alerts or verify_warnings) else 0,
     }
 
     from viper_gate import output_and_track

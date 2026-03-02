@@ -852,6 +852,110 @@ def build_regime_update_message(instance_id, regime, allocation, session_key=Non
     return msg
 
 
+def expand_instance_slots(instance_id, new_slots, new_margin_per_slot):
+    """Expand the slot count on a running instance.
+
+    Updates the COBRA instance record and writes the new config into the
+    instance's wolf-strategies.json (wolf) or tiger-config.json (tiger)
+    so the subagent's scripts pick up the change on the next scan cycle.
+
+    Returns dict with success, a sessions_send instruction to notify the
+    subagent, or an error.
+    """
+    spawn_file = os.path.join(SPAWNED_DIR, f"{instance_id}.json")
+    instance_data = load_json_safe(spawn_file)
+    if not instance_data:
+        return {"success": False, "error": f"Instance {instance_id} not found"}
+
+    itype = instance_data.get("type", "wolf")
+    old_slots = instance_data.get("slots", instance_data.get("maxSlots", 2))
+
+    if itype == "wolf":
+        instance_data["slots"] = new_slots
+        instance_data["marginPerSlot"] = new_margin_per_slot
+    else:
+        instance_data["maxSlots"] = new_slots
+
+    instance_data["expandedAt"] = utc_now()
+    instance_data["originalSlots"] = instance_data.get("originalSlots", old_slots)
+    save_spawned_instance(instance_id, instance_data)
+
+    _write_instance_config(instance_id, instance_data, itype, new_slots, new_margin_per_slot)
+
+    msg = build_expansion_message(
+        instance_id, old_slots, new_slots, new_margin_per_slot,
+        session_key=instance_data.get("childSessionKey"))
+
+    return {
+        "success": True,
+        "instanceId": instance_id,
+        "type": itype,
+        "oldSlots": old_slots,
+        "newSlots": new_slots,
+        "newMarginPerSlot": new_margin_per_slot,
+        "expansionMessage": msg,
+    }
+
+
+def _write_instance_config(instance_id, instance_data, itype, new_slots, new_margin):
+    """Write updated slot config into the instance workspace so subagent scripts see it."""
+    instance_ws = get_instance_workspace(instance_id, itype)
+
+    if itype == "wolf":
+        strategies_path = os.path.join(instance_ws, "wolf-strategies.json")
+        registry = load_json_safe(strategies_path) or {"strategies": {}}
+        for key, cfg in registry.get("strategies", {}).items():
+            cfg["slots"] = new_slots
+            cfg["marginPerSlot"] = new_margin
+        if not registry.get("strategies"):
+            strategy_key = instance_data.get("subagentLabel", instance_id)
+            registry["strategies"] = {
+                strategy_key: {
+                    "name": instance_data.get("wallet", instance_id),
+                    "wallet": instance_data.get("wallet", ""),
+                    "strategyId": instance_data.get("strategyId", ""),
+                    "budget": instance_data.get("budget", 0),
+                    "slots": new_slots,
+                    "marginPerSlot": new_margin,
+                    "defaultLeverage": instance_data.get("defaultLeverage", 7),
+                    "enabled": True,
+                }
+            }
+        atomic_write(strategies_path, registry)
+    else:
+        config_path = os.path.join(instance_ws, "tiger-config.json")
+        tiger_cfg = load_json_safe(config_path) or {}
+        tiger_cfg["maxSlots"] = new_slots
+        atomic_write(config_path, tiger_cfg)
+
+
+def build_expansion_message(instance_id, old_slots, new_slots, new_margin,
+                            session_key=None):
+    """Build a sessions_send instruction to notify a subagent of slot expansion."""
+    msg = {
+        "tool": "sessions_send",
+        "subagentLabel": instance_id,
+        "params": {
+            "message": (
+                f"COBRA SLOT EXPANSION for {instance_id}.\n"
+                f"Your slot limit has been increased from {old_slots} to {new_slots}.\n"
+                f"New margin per slot: ${new_margin:.0f}.\n\n"
+                f"Your config files have been updated. On your next scan cycle,\n"
+                f"you may open up to {new_slots} concurrent positions.\n"
+                f"Continue scanning and enter on strong signals."
+            ),
+        },
+    }
+    if session_key:
+        msg["params"]["sessionKey"] = session_key
+    else:
+        msg["_note"] = (
+            "sessionKey unknown — resolve subagentLabel to sessionKey "
+            "via sessions_list, then call sessions_send with that sessionKey."
+        )
+    return msg
+
+
 def get_spawn_summary():
     """Get a summary of all spawned instances for brain decisions."""
     instances = load_spawned_instances()
