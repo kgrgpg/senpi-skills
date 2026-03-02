@@ -31,25 +31,15 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cobra_config import (
     load_config, load_state, save_state, load_performance,
-    load_spawned_instances, save_spawned_instance, get_instance_state_dir,
-    mcporter_call_safe, load_json_safe, output, utc_now,
+    load_spawned_instances, load_killed_instances,
+    save_spawned_instance, get_instance_state_dir,
+    mcporter_call_safe, load_json_safe, output, utc_now, minutes_since,
     WORKSPACE, COBRA_STATE_DIR, SPAWNED_DIR,
 )
 
 SIGNAL_PRESSURE_FILE = os.path.join(COBRA_STATE_DIR, "cobra-signals.json")
 _SIGNAL_STALENESS_MINUTES = 10
-
-
-def _hours_since(iso_timestamp):
-    """Calculate hours since a given ISO timestamp."""
-    if not iso_timestamp:
-        return 999
-    try:
-        ts = datetime.fromisoformat(iso_timestamp.replace("Z", "+00:00"))
-        delta = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
-        return delta
-    except Exception:
-        return 999
+_SPAWN_VERIFY_MINUTES = 30
 
 
 def _get_regime():
@@ -72,6 +62,28 @@ def _get_regime():
     return result
 
 
+def _apply_regime_hysteresis(new_regime, new_confidence, state):
+    """Prevent regime flapping by requiring consecutive confirmation.
+
+    If the regime changed but confidence is < 0.65, keep the old regime
+    until a second consecutive reading confirms the switch.
+    """
+    prev_regime = state.get("regime", "UNKNOWN")
+    if prev_regime == "UNKNOWN" or new_regime == prev_regime:
+        state.pop("_pendingRegime", None)
+        return new_regime, new_confidence
+
+    pending = state.get("_pendingRegime")
+    if new_confidence >= 0.65:
+        return new_regime, new_confidence
+
+    if pending == new_regime:
+        return new_regime, new_confidence
+
+    state["_pendingRegime"] = new_regime
+    return prev_regime, new_confidence
+
+
 def _get_signal_pressure():
     """Load latest signal pressure data. Zeros out if stale."""
     default = {
@@ -84,11 +96,12 @@ def _get_signal_pressure():
         return default
 
     updated_at = data.get("updatedAt")
-    if updated_at and _hours_since(updated_at) * 60 > _SIGNAL_STALENESS_MINUTES:
+    age_min = minutes_since(updated_at)
+    if age_min > _SIGNAL_STALENESS_MINUTES:
         data["globalSignalPressure"] = 0
         data["marketOpportunityDensity"] = "STALE"
         data["_staleWarning"] = (
-            f"Signal data is {_hours_since(updated_at) * 60:.0f}min old "
+            f"Signal data is {age_min:.0f}min old "
             f"(threshold {_SIGNAL_STALENESS_MINUTES}min), zeroed out"
         )
     return data
@@ -124,23 +137,27 @@ def _evaluate_kill_vs_keep(instance_id, instance_data, signal_data, perf_data, c
 
     reasons = []
     decision = "KEEP"
+    keep_score = 0
 
     # --- KEEP conditions ---
 
-    # Tier 2+ positions: let trailing stops work
+    # Tier 2+ positions: strong reason to keep (trailing stop protecting gains),
+    # but not absolute — extreme drawdown or circuit breaker can still override.
     if itype == "wolf":
         pos_quality = instance_signals.get("positionQuality", {})
         tier2plus = pos_quality.get("tier2plus", 0)
         if tier2plus > 0:
+            keep_score += 40
             reasons.append(f"KEEP: {tier2plus} positions at Tier 2+ (trailing stop protecting gains)")
-            return {"decision": "KEEP", "reasons": reasons, "score": 0}
 
     # Low signal pressure: not missing much
     if signal_pressure < 40:
+        keep_score += 15
         reasons.append(f"KEEP: signal pressure {signal_pressure} < 40 (not much being missed)")
 
     # Strong positive uPnL trending up
     if upnl > budget * 0.05:
+        keep_score += 10
         reasons.append(f"KEEP: uPnL ${upnl:.0f} is +{upnl/budget*100:.1f}% (profitable)")
 
     # --- KILL conditions ---
@@ -164,7 +181,7 @@ def _evaluate_kill_vs_keep(instance_id, instance_data, signal_data, perf_data, c
 
     # Idle instance -- 0 positions for too long
     if active_positions == 0:
-        hours_alive = _hours_since(spawned_at)
+        hours_alive = minutes_since(spawned_at) / 60
         if hours_alive > idle_hours:
             kill_score += 35
             reasons.append(f"KILL signal: idle {hours_alive:.1f}h with 0 positions (threshold {idle_hours}h)")
@@ -194,12 +211,13 @@ def _evaluate_kill_vs_keep(instance_id, instance_data, signal_data, perf_data, c
                 f"uPnL ${upnl:.0f} + fees ${booking_cost:.0f} + restart ${restart_cost:.0f}"
             )
 
-    # --- Final decision ---
-    if kill_score >= 50:
+    # --- Final decision: net score = kill signals minus keep signals ---
+    net_score = kill_score - keep_score
+    if net_score >= 30:
         decision = "KILL"
-    elif kill_score >= 25:
+    elif net_score >= 0 and kill_score >= 25:
         decision = "WAIT"
-        reasons.append(f"WAIT: kill score {kill_score}/100 (need 50 to kill)")
+        reasons.append(f"WAIT: kill={kill_score} keep={keep_score} net={net_score} (need net 30 to kill)")
     else:
         decision = "KEEP"
         if not reasons:
@@ -209,7 +227,11 @@ def _evaluate_kill_vs_keep(instance_id, instance_data, signal_data, perf_data, c
 
 
 def _decide_spawns(regime_data, signal_data, state, config, current_instances):
-    """Decide whether to spawn new instances based on regime + idle capital."""
+    """Decide whether to spawn new instances based on regime + idle capital.
+
+    Accounts for trapped capital in killed instances whose funds haven't
+    been recovered, preventing over-deployment.
+    """
     cfg = config
     allocation = regime_data.get("allocation", {})
     regime = regime_data.get("regime", "UNKNOWN")
@@ -219,13 +241,22 @@ def _decide_spawns(regime_data, signal_data, state, config, current_instances):
     max_wolves = cfg.get("maxWolves", 2)
     max_tigers = cfg.get("maxTigers", 1)
 
-    active_wolves = sum(1 for v in current_instances.values() if v.get("type") == "wolf")
-    active_tigers = sum(1 for v in current_instances.values() if v.get("type") == "tiger")
-    allocated = sum(v.get("budget", 0) for v in current_instances.values())
+    # Only count active + pending_spawn instances (not kill_pending).
+    # Missing status treated as active for backward compatibility.
+    countable = {k: v for k, v in current_instances.items()
+                 if v.get("status", "active") not in ("kill_pending", "killed")}
+    active_wolves = sum(1 for v in countable.values() if v.get("type") == "wolf")
+    active_tigers = sum(1 for v in countable.values() if v.get("type") == "tiger")
+    allocated = sum(v.get("budget", 0) for v in countable.values())
+
+    # Subtract capital trapped in killed wallets that haven't been withdrawn
+    killed = load_killed_instances()
+    trapped_capital = sum(v.get("finalValue", v.get("budget", 0))
+                          for v in killed.values())
 
     reserve_pct = cfg.get("reservePct", 15)
     usable_budget = total_budget * (1 - reserve_pct / 100)
-    idle_capital = usable_budget - allocated
+    idle_capital = usable_budget - allocated - trapped_capital
 
     global_pressure = signal_data.get("globalSignalPressure", 0)
     spawn_pressure_threshold = cfg.get("killVsKeep", {}).get("signalPressureSpawnThreshold", 50)
@@ -325,13 +356,13 @@ def _retry_kill_pending(instances, config):
 
         retried_ids.add(iid)
         killed_at = idata.get("killedAt", "")
-        minutes_since = _hours_since(killed_at) * 60
+        mins_elapsed = minutes_since(killed_at)
         retries = idata.get("killRetries", 0)
 
-        if minutes_since < retry_minutes:
+        if mins_elapsed < retry_minutes:
             results.append({
                 "instanceId": iid, "action": "RETRY_WAIT",
-                "message": f"kill_pending {minutes_since:.0f}min, retry at {retry_minutes}min",
+                "message": f"kill_pending {mins_elapsed:.0f}min, retry at {retry_minutes}min",
             })
             continue
 
@@ -366,21 +397,52 @@ def _retry_kill_pending(instances, config):
 def _verify_pending_actions(state, instances):
     """Verify that actions requested in the previous brain run were executed.
 
-    Returns list of warnings and list of kill dicts to re-issue.
+    Spawn verification: instances start as pending_spawn. If they haven't
+    produced any evidence of activity (scan files, performance data) within
+    _SPAWN_VERIFY_MINUTES, warn — the cron agent likely failed to execute
+    sessions_spawn even though the wallet was funded.
+
+    Returns list of warnings, list of kill dicts to re-issue, and list of
+    instance IDs to promote from pending_spawn to active.
     """
     prev = state.get("pendingActions", {})
     warnings = []
     re_kills = []
+    promote_ids = []
 
-    for spawn_id in prev.get("spawns", []):
-        if spawn_id not in instances:
+    # Check for pending_spawn instances that have been waiting too long
+    for iid, idata in instances.items():
+        if idata.get("status") != "pending_spawn":
+            continue
+        age = minutes_since(idata.get("spawnedAt"))
+        itype = idata.get("type", "wolf")
+        instance_ws = os.path.join(WORKSPACE, "instances", iid)
+
+        has_evidence = False
+        if os.path.isdir(instance_ws):
+            for f in ("emerging-movers-history.json", "scan-history.json",
+                      "prescreened.json", "tiger-state.json"):
+                if os.path.exists(os.path.join(instance_ws, f)):
+                    has_evidence = True
+                    break
+
+        perf = load_json_safe(os.path.join(COBRA_STATE_DIR, "cobra-performance.json")) or {}
+        if iid in perf.get("instances", {}):
+            perf_entry = perf["instances"][iid]
+            if perf_entry.get("utilization", 0) > 0:
+                has_evidence = True
+
+        if has_evidence:
+            promote_ids.append(iid)
+        elif age > _SPAWN_VERIFY_MINUTES:
             warnings.append(
-                f"WARNING: spawn {spawn_id} from previous run not found — "
-                f"cron agent may have failed to execute sessions_spawn")
+                f"WARNING: spawn {iid} has been pending_spawn for {age:.0f}min "
+                f"with no activity — subagent may not have started. "
+                f"Wallet {idata.get('wallet', '?')} is funded but idle.")
 
     for kill_id in prev.get("kills", []):
         idata = instances.get(kill_id)
-        if idata and idata.get("status") == "active":
+        if idata and idata.get("status") in ("active", "pending_spawn"):
             warnings.append(
                 f"WARNING: kill {kill_id} from previous run still active — re-issuing")
             re_kills.append({
@@ -388,7 +450,7 @@ def _verify_pending_actions(state, instances):
                 "reason": "missed kill from previous brain run",
             })
 
-    return warnings, re_kills
+    return warnings, re_kills, promote_ids
 
 
 def run():
@@ -396,10 +458,20 @@ def run():
     config = load_config()
     state = load_state()
 
-    # Step 1: Regime classification
+    # Step 1: Regime classification with hysteresis
     regime_data = _get_regime()
-    regime = regime_data.get("regime", "UNKNOWN")
-    confidence = regime_data.get("confidence", 0)
+    raw_regime = regime_data.get("regime", "UNKNOWN")
+    raw_confidence = regime_data.get("confidence", 0)
+    regime, confidence = _apply_regime_hysteresis(raw_regime, raw_confidence, state)
+    if regime != raw_regime:
+        regime_data["regime"] = regime
+        regime_data["_rawRegime"] = raw_regime
+        spec = importlib.util.spec_from_file_location(
+            "cobra_regime_alloc",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "cobra-regime.py"))
+        alloc_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(alloc_mod)
+        regime_data["allocation"] = alloc_mod.get_allocation(regime)
 
     # Step 2: Signal pressure
     signal_data = _get_signal_pressure()
@@ -413,8 +485,13 @@ def run():
     # Step 4a: Retry kill_pending instances (deterministic retry before any decisions)
     kill_pending_results, pending_ids = _retry_kill_pending(instances, config)
 
-    # Step 4b: Verify actions from previous brain run were executed
-    verify_warnings, re_kills = _verify_pending_actions(state, instances)
+    # Step 4b: Verify actions from previous brain run + promote confirmed spawns
+    verify_warnings, re_kills, promote_ids = _verify_pending_actions(state, instances)
+    for pid in promote_ids:
+        idata = instances.get(pid)
+        if idata:
+            idata["status"] = "active"
+            save_spawned_instance(pid, idata)
 
     # Step 4c: Portfolio-level circuit breaker
     portfolio_breaker_tripped = _check_portfolio_circuit_breaker(config, perf_data, instances)
@@ -496,6 +573,8 @@ def run():
     # Step 9: Detect regime shift
     prev_regime = state.get("regime", "UNKNOWN")
     regime_shifted = prev_regime != regime and prev_regime != "UNKNOWN"
+    if regime_shifted:
+        state.pop("_pendingRegime", None)
 
     # Step 10: Build subagent regime update messages if regime shifted
     # Re-load instances here since kills/spawns may have changed disk state

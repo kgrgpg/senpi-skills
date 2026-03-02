@@ -30,8 +30,8 @@ from cobra_config import (
     load_config, load_spawned_instances, save_spawned_instance,
     get_instance_state_dir, get_instance_workspace, ensure_instance_workspace,
     mcporter_call, mcporter_call_safe,
-    atomic_write, output, utc_now, load_json_safe, WORKSPACE,
-    COBRA_STATE_DIR, SPAWNED_DIR,
+    atomic_write, output, utc_now, load_json_safe, minutes_since,
+    WORKSPACE, COBRA_STATE_DIR, SPAWNED_DIR,
 )
 from viper_gate import wrap_mandate, generate_cron_payload
 
@@ -252,26 +252,13 @@ def _compute_leverage(budget, regime="TRENDING"):
     return base
 
 
-def spawn_wolf(budget, dsl_preset="aggressive", name=None, config=None,
-               regime="TRENDING"):
-    """Spawn a new WOLF instance via sessions_spawn.
+def _create_and_fund_wallet(budget, name, config=None):
+    """Create a strategy wallet and fund it. Shared by wolf and tiger spawns.
 
-    1. Create strategy wallet via MCP
-    2. Fund it
-    3. Build subagent task description
-    4. Register in COBRA state
-    5. Output sessions_spawn instruction for the agent
-
-    Returns dict with instance_id, wallet, subagent_task, or error.
+    Returns (wallet, strategy_uuid) on success.
+    Raises RuntimeError or returns an error dict on failure, cleaning up
+    the orphaned strategy if funding fails.
     """
-    cfg = config or load_config()
-    chat_id = cfg.get("telegramChatId", "")
-    mid_model = cfg.get("midModel", "anthropic/claude-sonnet-4-20250514")
-
-    instance_id = _generate_instance_id("wolf")
-    if name is None:
-        name = f"COBRA-{instance_id}"
-
     try:
         create_result = mcporter_call("strategy_create_custom_strategy", name=name)
         wallet = create_result.get("wallet", create_result.get("address", ""))
@@ -285,6 +272,7 @@ def spawn_wolf(budget, dsl_preset="aggressive", name=None, config=None,
     try:
         mcporter_call("strategy_top_up", amount=budget, strategyId=strategy_uuid)
     except RuntimeError as e:
+        mcporter_call_safe("strategy_delete", strategyId=strategy_uuid)
         return {"success": False, "error": f"Failed to fund strategy: {e}",
                 "wallet": wallet, "strategyId": strategy_uuid}
 
@@ -292,12 +280,41 @@ def spawn_wolf(budget, dsl_preset="aggressive", name=None, config=None,
     if verify_ch:
         actual_value = float(verify_ch.get("accountValue", verify_ch.get("equity", 0)))
         if actual_value < budget * 0.95:
+            mcporter_call_safe("strategy_delete", strategyId=strategy_uuid)
             return {
                 "success": False,
                 "error": f"Funding verification failed: expected ~${budget:.0f}, "
                          f"got ${actual_value:.0f}",
                 "wallet": wallet, "strategyId": strategy_uuid,
             }
+
+    return wallet, strategy_uuid
+
+
+def spawn_wolf(budget, dsl_preset="aggressive", name=None, config=None,
+               regime="TRENDING"):
+    """Spawn a new WOLF instance via sessions_spawn.
+
+    1. Create strategy wallet via MCP
+    2. Fund it
+    3. Build subagent task description
+    4. Register in COBRA state (status=pending_spawn)
+    5. Output sessions_spawn instruction for the agent
+
+    Returns dict with instance_id, wallet, subagent_task, or error.
+    """
+    cfg = config or load_config()
+    chat_id = cfg.get("telegramChatId", "")
+    mid_model = cfg.get("midModel", "anthropic/claude-sonnet-4-20250514")
+
+    instance_id = _generate_instance_id("wolf")
+    if name is None:
+        name = f"COBRA-{instance_id}"
+
+    result = _create_and_fund_wallet(budget, name, cfg)
+    if isinstance(result, dict):
+        return result
+    wallet, strategy_uuid = result
 
     slots = _compute_slots(budget)
     margin_per_slot = round(budget * 0.30, 2)
@@ -340,7 +357,7 @@ def spawn_wolf(budget, dsl_preset="aggressive", name=None, config=None,
         "marginPerSlot": margin_per_slot,
         "defaultLeverage": default_leverage,
         "dslPreset": dsl_preset,
-        "status": "active",
+        "status": "pending_spawn",
         "spawnedAt": utc_now(),
         "subagentLabel": instance_id,
         "cronNames": [c["name"] for c in cron_payloads],
@@ -439,32 +456,10 @@ def spawn_tiger(budget, goal_pct=5, max_slots=3, name=None, config=None,
     if name is None:
         name = f"COBRA-{instance_id}"
 
-    try:
-        create_result = mcporter_call("strategy_create_custom_strategy", name=name)
-        wallet = create_result.get("wallet", create_result.get("address", ""))
-        strategy_uuid = create_result.get("strategyId", create_result.get("id", ""))
-    except RuntimeError as e:
-        return {"success": False, "error": f"Failed to create strategy: {e}"}
-
-    if not wallet:
-        return {"success": False, "error": "No wallet returned from strategy creation"}
-
-    try:
-        mcporter_call("strategy_top_up", amount=budget, strategyId=strategy_uuid)
-    except RuntimeError as e:
-        return {"success": False, "error": f"Failed to fund strategy: {e}",
-                "wallet": wallet, "strategyId": strategy_uuid}
-
-    verify_ch = mcporter_call_safe("strategy_get_clearinghouse_state", wallet=wallet)
-    if verify_ch:
-        actual_value = float(verify_ch.get("accountValue", verify_ch.get("equity", 0)))
-        if actual_value < budget * 0.95:
-            return {
-                "success": False,
-                "error": f"Funding verification failed: expected ~${budget:.0f}, "
-                         f"got ${actual_value:.0f}",
-                "wallet": wallet, "strategyId": strategy_uuid,
-            }
+    result = _create_and_fund_wallet(budget, name, cfg)
+    if isinstance(result, dict):
+        return result
+    wallet, strategy_uuid = result
 
     instance_workspace = ensure_instance_workspace(instance_id)
     scripts = _resolve_scripts_dir("tiger")
@@ -497,7 +492,7 @@ def spawn_tiger(budget, goal_pct=5, max_slots=3, name=None, config=None,
         "budget": budget,
         "maxSlots": max_slots,
         "goalPct": goal_pct,
-        "status": "active",
+        "status": "pending_spawn",
         "spawnedAt": utc_now(),
         "subagentLabel": instance_id,
         "cronNames": [c["name"] for c in cron_payloads],
@@ -584,14 +579,75 @@ def build_kill_message(instance_id, reason):
     }
 
 
+def _close_positions_via_clearinghouse(wallet, instance_id, itype):
+    """Close all positions using clearinghouse state as source of truth.
+
+    Works for both WOLF and TIGER — queries the chain for actual positions
+    instead of relying on local DSL files that may be out of sync.
+    Also deactivates local DSL files for any closed position.
+    """
+    close_results = []
+    state_dir = get_instance_state_dir(instance_id, itype)
+
+    ch = mcporter_call_safe("strategy_get_clearinghouse_state", wallet=wallet)
+    if ch:
+        positions = ch.get("positions", ch.get("assetPositions", []))
+        for pos in positions:
+            asset = pos.get("coin", pos.get("asset", ""))
+            if not asset:
+                continue
+            size = abs(float(pos.get("szi", pos.get("size", 0))))
+            if size == 0:
+                continue
+            direction = "LONG" if float(pos.get("szi", pos.get("size", 0))) > 0 else "SHORT"
+            try:
+                close_data = mcporter_call("close_position", wallet=wallet, asset=asset)
+                close_results.append({
+                    "asset": asset, "direction": direction,
+                    "status": "closed", "data": close_data,
+                })
+            except RuntimeError as e:
+                close_results.append({
+                    "asset": asset, "direction": direction,
+                    "status": "error", "error": str(e),
+                })
+
+    # Deactivate local DSL files for any positions we closed or attempted
+    closed_assets = {r["asset"] for r in close_results}
+    dsl_files = glob.glob(os.path.join(state_dir, "dsl-*.json"))
+    for dsl_path in dsl_files:
+        state = load_json_safe(dsl_path)
+        if not state or not state.get("active"):
+            continue
+        if state.get("asset") in closed_assets:
+            state["active"] = False
+            state["closedBy"] = "cobra-kill"
+            state["closedAt"] = utc_now()
+            atomic_write(dsl_path, state)
+
+    return close_results, ch
+
+
+def _attempt_fund_recovery(wallet, strategy_uuid):
+    """Attempt to withdraw remaining funds from a killed strategy wallet.
+
+    Returns (recovered: bool, amount: float).
+    Uses strategy_withdraw if available; gracefully returns False if the
+    MCP tool doesn't exist.
+    """
+    result = mcporter_call_safe("strategy_withdraw", strategyId=strategy_uuid)
+    if result is not None:
+        amount = float(result.get("amount", result.get("withdrawn", 0)))
+        return True, amount
+    return False, 0
+
+
 def kill_instance(instance_id, reason="brain_decision"):
     """Kill a spawned instance.
 
-    Closes positions via MCP (as fallback/verification), marks killed,
-    and outputs instructions for the agent to:
-    1. Send kill order to the subagent via sessions_send
-    2. Kill the subagent session via /subagents kill
-    3. Delete the wake crons
+    Uses clearinghouse state (not local DSL files) as the source of truth
+    for open positions. After closing, attempts to recover funds. Marks
+    killed and outputs instructions for the agent.
 
     Returns dict with realized_pnl, freed_capital, actions for agent.
     """
@@ -606,50 +662,10 @@ def kill_instance(instance_id, reason="brain_decision"):
     wallet = instance_data.get("wallet", "")
     itype = instance_data.get("type", "wolf")
     budget = instance_data.get("budget", 0)
+    strategy_uuid = instance_data.get("strategyId", "")
 
-    # Close positions via MCP as a direct action (don't rely solely on subagent)
-    close_results = []
-    state_dir = get_instance_state_dir(instance_id, itype)
-
-    if itype == "wolf":
-        dsl_files = glob.glob(os.path.join(state_dir, "dsl-*.json"))
-        for dsl_path in dsl_files:
-            state = load_json_safe(dsl_path)
-            if not state or not state.get("active"):
-                continue
-            asset = state.get("asset", "")
-            direction = state.get("direction", "LONG")
-            try:
-                close_data = mcporter_call("close_position", wallet=wallet, asset=asset)
-                state["active"] = False
-                state["closedBy"] = "cobra-kill"
-                state["closedAt"] = utc_now()
-                atomic_write(dsl_path, state)
-                close_results.append({
-                    "asset": asset, "direction": direction,
-                    "status": "closed", "data": close_data,
-                })
-            except RuntimeError as e:
-                close_results.append({
-                    "asset": asset, "direction": direction,
-                    "status": "error", "error": str(e),
-                })
-    elif itype == "tiger":
-        ch = mcporter_call_safe("strategy_get_clearinghouse_state", wallet=wallet)
-        if ch:
-            positions = ch.get("positions", ch.get("assetPositions", []))
-            for pos in positions:
-                asset = pos.get("coin", pos.get("asset", ""))
-                if not asset:
-                    continue
-                size = abs(float(pos.get("szi", pos.get("size", 0))))
-                if size == 0:
-                    continue
-                try:
-                    close_data = mcporter_call("close_position", wallet=wallet, asset=asset)
-                    close_results.append({"asset": asset, "status": "closed", "data": close_data})
-                except RuntimeError as e:
-                    close_results.append({"asset": asset, "status": "error", "error": str(e)})
+    close_results, ch_before = _close_positions_via_clearinghouse(
+        wallet, instance_id, itype)
 
     final_ch = mcporter_call_safe("strategy_get_clearinghouse_state", wallet=wallet)
     final_value = float(final_ch.get("accountValue", final_ch.get("equity", 0))) if final_ch else 0
@@ -663,14 +679,19 @@ def kill_instance(instance_id, reason="brain_decision"):
             if size > 0:
                 remaining_positions += 1
     else:
-        if itype == "tiger" and not close_results:
+        if not close_results:
             remaining_positions = 1
-        elif close_results and any(r["status"] == "error" for r in close_results):
+        elif any(r["status"] == "error" for r in close_results):
             remaining_positions = len([r for r in close_results if r["status"] == "error"])
 
     kill_status = "killed"
     if remaining_positions > 0:
         kill_status = "kill_pending"
+
+    funds_recovered = False
+    recovered_amount = 0
+    if kill_status == "killed" and strategy_uuid:
+        funds_recovered, recovered_amount = _attempt_fund_recovery(wallet, strategy_uuid)
 
     instance_data["status"] = kill_status
     instance_data["killedAt"] = utc_now()
@@ -679,9 +700,10 @@ def kill_instance(instance_id, reason="brain_decision"):
     instance_data["realizedPnl"] = realized_pnl
     instance_data["closeResults"] = close_results
     instance_data["remainingPositions"] = remaining_positions
+    instance_data["fundsRecovered"] = funds_recovered
+    instance_data["recoveredAmount"] = recovered_amount
     save_spawned_instance(instance_id, instance_data)
 
-    # Build kill message for subagent (graceful shutdown)
     kill_msg = build_kill_message(instance_id, reason)
 
     return {
@@ -690,7 +712,8 @@ def kill_instance(instance_id, reason="brain_decision"):
         "killStatus": kill_status,
         "realizedPnl": realized_pnl,
         "finalValue": final_value,
-        "freedCapital": final_value,
+        "freedCapital": recovered_amount if funds_recovered else final_value,
+        "fundsRecovered": funds_recovered,
         "positionsClosed": len([r for r in close_results if r["status"] == "closed"]),
         "closeErrors": len([r for r in close_results if r["status"] == "error"]),
         "remainingPositions": remaining_positions,

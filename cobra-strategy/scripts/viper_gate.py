@@ -12,7 +12,8 @@ Usage:
 import json, os, time
 from cobra_config import (
     COBRA_STATE_DIR, TOKEN_BUDGET_FILE, atomic_write,
-    load_token_budget, save_token_budget, utc_now, utc_today,
+    load_token_budget, save_token_budget, locked_read_modify_write,
+    utc_now, utc_today,
 )
 
 VIPER_PREFIX = (
@@ -34,35 +35,35 @@ def estimate_tokens(text):
 
 
 def track_invocation(cron_name, output_size_chars, was_actionable=False):
-    """Log a cron invocation to the daily token budget tracker."""
-    budget = load_token_budget()
+    """Log a cron invocation to the daily token budget tracker.
 
-    if budget.get("date") != utc_today():
-        budget = {
-            "date": utc_today(),
-            "totalTokensEstimated": 0,
-            "invocations": {},
-            "recommendations": [],
-        }
-
+    Uses file locking to prevent concurrent read-modify-write races
+    between overlapping cron processes.
+    """
     estimated_input = 800
     estimated_output = estimate_tokens(str(output_size_chars))
     total = estimated_input + estimated_output
 
-    budget["totalTokensEstimated"] += total
+    def _update(budget):
+        if budget.get("date") != utc_today():
+            budget = {
+                "date": utc_today(),
+                "totalTokensEstimated": 0,
+                "invocations": {},
+                "recommendations": [],
+            }
+        budget["totalTokensEstimated"] = budget.get("totalTokensEstimated", 0) + total
+        if cron_name not in budget.get("invocations", {}):
+            budget.setdefault("invocations", {})[cron_name] = {
+                "count": 0, "actionable": 0, "totalTokens": 0,
+            }
+        budget["invocations"][cron_name]["count"] += 1
+        if was_actionable:
+            budget["invocations"][cron_name]["actionable"] += 1
+        budget["invocations"][cron_name]["totalTokens"] += total
+        return budget
 
-    if cron_name not in budget["invocations"]:
-        budget["invocations"][cron_name] = {
-            "count": 0,
-            "actionable": 0,
-            "totalTokens": 0,
-        }
-    budget["invocations"][cron_name]["count"] += 1
-    if was_actionable:
-        budget["invocations"][cron_name]["actionable"] += 1
-    budget["invocations"][cron_name]["totalTokens"] += total
-
-    save_token_budget(budget)
+    locked_read_modify_write(TOKEN_BUDGET_FILE, _update)
 
 
 def get_budget_status(daily_limit=5000000):

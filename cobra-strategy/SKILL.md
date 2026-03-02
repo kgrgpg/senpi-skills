@@ -125,7 +125,11 @@ WOLF and TIGER screeners produce rich signal data that goes unused when capital 
 
 **WOLF:** `missedFirstJumps × 15 + missedOpportunities × 8 + 10 if slots full`
 
-**TIGER:** `highScoreCandidates × 10 + (density - 15) × 5 if ≥ 25 + 15 if slots full + 10 if ELEVATED/ABORT - 20 if halted`
+Signals for assets already being traded (active or recently closed DSL positions) are excluded from the "missed" count, preventing inflation from traded signals.
+
+**TIGER:** `highScoreCandidates × 10 + (density - 25) × 3 if density ≥ 35 + 15 if slots full + 10 if ELEVATED/ABORT - 20 if halted`
+
+Density bonus uses a higher threshold (35) and gentler multiplier (3) so normal candidate counts (20-30) don't inflate pressure.
 
 **Pressure > 60 + slots full = COBRA should spawn more capacity or kill an underperformer.**
 
@@ -137,22 +141,27 @@ WOLF and TIGER screeners produce rich signal data that goes unused when capital 
 
 Since Senpi does not support partial withdrawal, COBRA must decide: **kill the entire instance (close all, book PnL, reclaim capital) or let it ride.**
 
-### KEEP when
-- Any position is Tier 2+ DSL (trailing stop protecting significant gains) — let it run
-- Signal pressure < 40 (not much is being missed)
-- uPnL is strongly positive and trending up
+### Weighted Kill-vs-Keep Scoring
 
-### KILL when
-- All positions Phase 1 + negative ROE (capital is unproductive)
-- Signal pressure > 60 (many good signals being missed)
-- `opportunity_ev > unrealized_pnl + booking_cost + restart_cost`
-- Instance idle 2+ hours with 0 positions
-- Portfolio circuit breaker (drawdown exceeds threshold)
+Decisions use a **net score** (`kill_score - keep_score`). This prevents any single signal from making an absolute decision — even Tier 2+ positions can be overridden by catastrophic drawdown + high signal pressure.
 
-### WAIT when
-- Mixed positions (some good, some bad) — let DSL natural exits free slots
-- Signal pressure moderate (40-60) — not urgent enough to kill
-- Regime is shifting — wait for next cycle to confirm
+**KEEP signals (reduce kill likelihood):**
+- Tier 2+ positions: **+40 keep** (trailing stop protecting gains — strong but not absolute)
+- Signal pressure < 40: **+15 keep** (not much being missed)
+- uPnL > 5% of budget: **+10 keep** (profitable)
+
+**KILL signals (increase kill likelihood):**
+- All positions Phase 1 + negative ROE: **+30 kill**
+- Signal pressure > threshold: **+25 kill**
+- Idle 2+ hours, 0 positions: **+35 kill**
+- Drawdown exceeds per-instance max: **+30 kill**
+- Opportunity EV exceeds holding value: **+20 kill**
+- Portfolio circuit breaker: **unconditional kill-all**
+
+**Decision thresholds:**
+- `net_score >= 30` → **KILL**
+- `net_score >= 0 and kill_score >= 25` → **WAIT** (ambiguous — let DSL exits free slots)
+- Otherwise → **KEEP**
 
 ### Kill Cost Model
 ```
@@ -264,23 +273,27 @@ All writes are atomic (write to `.tmp`, then `os.replace`). Full schemas: [refer
 ## Safety Features
 
 1. **Portfolio circuit breaker.** Compares current portfolio value against *allocated capital* (sum of instance budgets), not totalBudget. If drawdown exceeds `portfolioMaxDrawdownPct` (default 15%), all instances are killed. Unallocated/reserved cash is excluded from the calculation so partially-deployed portfolios don't false-trigger.
-2. **Funding verification.** After topping up a new strategy wallet, COBRA verifies the balance arrived before proceeding.
+2. **Funding verification.** After topping up a new strategy wallet, COBRA verifies the balance arrived before proceeding. If funding fails, the orphaned strategy is cleaned up automatically.
+3. **Clearinghouse-based position discovery.** Kill operations query the chain via `strategy_get_clearinghouse_state` for both WOLF and TIGER, ensuring all positions are found — even those not tracked by local DSL files.
 4. **Kill-pending retry.** After closing positions, COBRA checks for remaining open positions. If any persist, the instance is marked `kill_pending`. The brain retries every `killPendingRetryMinutes` (default 5), up to `killPendingMaxRetries` (default 3). After max retries, the instance is flagged STUCK and an alert is emitted for manual intervention.
-5. **Pending-action verification.** Each brain run verifies that spawns/kills requested in the previous run actually materialized. Missed kills are automatically re-issued; missed spawns generate warnings.
-6. **Signal staleness detection.** If signal pressure data is older than 10 minutes, it's zeroed out to avoid acting on stale signals.
-7. **Regime-aware leverage.** Default leverage scales with market conditions: full in TRENDING, reduced in RANGING (5-8x), halved in VOLATILE (3-5x).
-8. **Dry-run mode.** Set `COBRA_DRY_RUN=1` to run all decision logic without executing MCP calls.
+5. **Spawn verification.** New instances start with `pending_spawn` status. The brain monitors for evidence of subagent activity (scan files, performance data). If no activity is detected within 30 minutes, a warning is emitted — the funded wallet is idle because the cron agent likely failed to execute `sessions_spawn`.
+6. **Trapped capital accounting.** After killing an instance, COBRA attempts to recover funds via `strategy_withdraw`. If withdrawal fails, the capital is tracked as "trapped" and subtracted from available budget, preventing over-deployment on new spawns.
+7. **Signal staleness detection.** If signal pressure data is older than 10 minutes, it's zeroed out to avoid acting on stale signals.
+8. **Regime hysteresis.** Low-confidence regime transitions (< 0.65) require two consecutive readings before COBRA switches, preventing allocation churn from ADX boundary oscillation.
+9. **Regime-aware leverage.** Default leverage scales with market conditions: full in TRENDING, reduced in RANGING (5-8x), halved in VOLATILE (3-5x).
+10. **Concurrent-safe state writes.** All state files use unique temp files via `tempfile.mkstemp` + `os.replace`. Token budget updates use file locking (`fcntl.flock`) to prevent read-modify-write races between overlapping crons.
+11. **Dry-run mode.** Set `COBRA_DRY_RUN=1` to run all decision logic without executing MCP calls.
 
 ## Known Limitations
 
-1. **No partial withdrawals.** Senpi requires closing all positions to withdraw from a strategy. This is why the kill-vs-keep framework exists.
+1. **No partial withdrawals.** Senpi requires closing all positions to withdraw from a strategy. This is why the kill-vs-keep framework exists. COBRA attempts `strategy_withdraw` after kills — if the tool isn't available yet, capital is tracked as trapped and excluded from spawn budgeting.
 2. **Per-instance workspace isolation.** Each subagent gets a dedicated workspace (`instances/{id}/`) via `OPENCLAW_WORKSPACE` env var. Scan files are written there so signal pressure is computed per-instance. Legacy instances that wrote to the shared root are handled via fallback reads.
-3. **Agent must execute spawn/kill.** COBRA outputs `sessions_spawn` and `sessions_send` instructions — the agent on the main session must execute them. The brain verifies on the next cycle whether actions were carried out and re-issues missed kills automatically.
-4. **No backtesting.** Regime classifier and signal pressure are based on live data only. Unit tests cover circuit breaker, kill-vs-keep, leverage, and retry logic.
+3. **Agent must execute spawn/kill.** COBRA outputs `sessions_spawn` and `sessions_send` instructions — the agent on the main session must execute them. The brain verifies on the next cycle whether actions were carried out: missed kills are automatically re-issued, and stale `pending_spawn` instances (no activity after 30 min) generate warnings.
+4. **No backtesting.** Regime classifier and signal pressure are based on live data only. Unit tests cover circuit breaker, kill-vs-keep, leverage, retry logic, regime classification, signal pressure scoring, regime hysteresis, spawn verification, and trapped capital accounting.
 5. **WOLF/TIGER skill dependency.** COBRA assumes wolf-strategy and tiger skills are installed and functional.
 6. **Subagent session limits.** OpenClaw's `maxChildrenPerAgent` (default 5) caps concurrent subagents. With 2 WOLF + 1 TIGER, this is fine. Increase if running more instances.
 7. **Subagent auto-archive.** OpenClaw archives subagent sessions after `archiveAfterMinutes` (default 60). COBRA's wake crons keep sessions alive by sending periodic messages.
-8. **No automated subagent respawn.** If a subagent session dies, its wake crons detect `SUBAGENT_DOWN` but there is no automated recovery. The brain does not currently respawn dead subagents -- monitor manually and redeploy if needed.
+8. **No automated subagent respawn.** If a subagent session dies, its wake crons detect `SUBAGENT_DOWN` but there is no automated recovery. The brain does not currently respawn dead subagents — monitor manually and redeploy if needed.
 
 ---
 

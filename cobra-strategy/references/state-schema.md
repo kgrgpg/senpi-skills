@@ -146,10 +146,11 @@ Signal pressure data. Updated by `cobra-signals.py` every 5 min.
 - `missedOpportunities1h * 8` (175+ score opportunities)
 - `+10` if slots full and any pressure > 0
 - Capped at 100
+- Signals for assets with active or recently closed DSL positions are excluded
 
 **TIGER instances:**
 - `highConfluenceCount * 10` (0.65+ confluence scanners)
-- `(prescreenerDensity - 15) * 5` if density >= 25
+- `(prescreenerDensity - 25) * 3` if density >= 35
 - `+15` if slots full and any confluence signals
 - `+10` if aggression ELEVATED or ABORT
 - Capped at 100

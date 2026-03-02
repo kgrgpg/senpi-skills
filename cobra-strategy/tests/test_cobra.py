@@ -89,7 +89,7 @@ class TestKillVsKeep(unittest.TestCase):
             "cobra_brain", os.path.join(SCRIPTS_DIR, "cobra-brain.py"))
 
     def test_keep_on_tier2_positions(self):
-        """Tier 2+ positions should always KEEP (trailing stop protecting gains)."""
+        """Tier 2+ positions should strongly favor KEEP via weighted scoring."""
         brain = self._load_brain()
         config = {"killVsKeep": {
             "signalPressureKillThreshold": 60, "idleHoursBeforeKill": 2,
@@ -107,6 +107,30 @@ class TestKillVsKeep(unittest.TestCase):
             "wolf-1", {"type": "wolf", "budget": 5000, "spawnedAt": ""},
             signal_data, perf_data, config)
         self.assertEqual(result["decision"], "KEEP")
+
+    def test_tier2_can_be_overridden_by_extreme_drawdown(self):
+        """Even with Tier 2+, extreme drawdown + high signal pressure can force KILL."""
+        brain = self._load_brain()
+        config = {"killVsKeep": {
+            "signalPressureKillThreshold": 60, "idleHoursBeforeKill": 2,
+            "avgFeePerTrade": 32, "maxDrawdownPct": 20,
+        }}
+        signal_data = {"instances": {"wolf-1": {
+            "signalPressure": 90,
+            "positionQuality": {"phase1": 2, "tier1": 0, "tier2plus": 1},
+            "avgPositionROE": -15,
+            "missedFirstJumps1h": 5, "missedOpportunities1h": 3,
+            "highConfluenceCount": 0, "recentWinRate": 0.6,
+        }}}
+        perf_data = {"instances": {"wolf-1": {
+            "accountValue": 3800, "unrealizedPnl": -200, "utilization": 80,
+            "drawdownFromPeak": 25, "tradeStats": {"activePositions": 3},
+        }}}
+        result = brain._evaluate_kill_vs_keep(
+            "wolf-1", {"type": "wolf", "budget": 5000,
+                       "spawnedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")},
+            signal_data, perf_data, config)
+        self.assertIn(result["decision"], ("KILL", "WAIT"))
 
     def test_kill_idle_instance(self):
         """Idle for 3+ hours with 0 positions and high signal pressure = KILL."""
@@ -261,28 +285,61 @@ class TestPendingActionVerification(unittest.TestCase):
         return _import_hyphenated(
             "cobra_brain", os.path.join(SCRIPTS_DIR, "cobra-brain.py"))
 
-    def test_detects_missed_spawn(self):
+    def test_detects_stale_pending_spawn(self):
+        """pending_spawn with no activity after threshold triggers warning."""
         brain = self._load_brain()
-        state = {"pendingActions": {"spawns": ["wolf-abc"], "kills": []}}
-        instances = {}
-        warnings, re_kills = brain._verify_pending_actions(state, instances)
+        old_time = (datetime.now(timezone.utc) - timedelta(minutes=45)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        state = {"pendingActions": {"spawns": [], "kills": []}}
+        instances = {"wolf-abc": {
+            "status": "pending_spawn", "spawnedAt": old_time,
+            "type": "wolf", "wallet": "0xfake", "budget": 5000,
+        }}
+        warnings, re_kills, promote_ids = brain._verify_pending_actions(state, instances)
         self.assertEqual(len(warnings), 1)
         self.assertIn("wolf-abc", warnings[0])
+        self.assertIn("pending_spawn", warnings[0])
 
     def test_reissues_missed_kill(self):
         brain = self._load_brain()
         state = {"pendingActions": {"spawns": [], "kills": ["wolf-def"]}}
         instances = {"wolf-def": {"status": "active", "budget": 5000}}
-        warnings, re_kills = brain._verify_pending_actions(state, instances)
+        warnings, re_kills, promote_ids = brain._verify_pending_actions(state, instances)
         self.assertEqual(len(re_kills), 1)
         self.assertEqual(re_kills[0]["instanceId"], "wolf-def")
 
     def test_no_warnings_when_clean(self):
         brain = self._load_brain()
         state = {"pendingActions": {"spawns": [], "kills": []}}
-        warnings, re_kills = brain._verify_pending_actions(state, {})
+        warnings, re_kills, promote_ids = brain._verify_pending_actions(state, {})
         self.assertEqual(len(warnings), 0)
         self.assertEqual(len(re_kills), 0)
+
+    def test_funded_but_idle_not_promoted(self):
+        """pending_spawn with accountValue > 0 but utilization == 0 must NOT promote."""
+        brain = self._load_brain()
+        perf_dir = os.path.join(_TEST_WORKSPACE, "state", "cobra")
+        os.makedirs(perf_dir, exist_ok=True)
+        perf_path = os.path.join(perf_dir, "cobra-performance.json")
+        with open(perf_path, "w") as f:
+            json.dump({"instances": {"wolf-funded": {
+                "accountValue": 3000, "utilization": 0,
+            }}}, f)
+        old_time = (datetime.now(timezone.utc) - timedelta(minutes=45)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        state = {"pendingActions": {"spawns": [], "kills": []}}
+        instances = {"wolf-funded": {
+            "status": "pending_spawn", "spawnedAt": old_time,
+            "type": "wolf", "wallet": "0xfake", "budget": 3000,
+        }}
+        try:
+            warnings, re_kills, promote_ids = brain._verify_pending_actions(state, instances)
+            self.assertNotIn("wolf-funded", promote_ids)
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("wolf-funded", warnings[0])
+        finally:
+            if os.path.exists(perf_path):
+                os.unlink(perf_path)
 
 
 class TestSpawnDecisions(unittest.TestCase):
@@ -368,11 +425,13 @@ class TestSignalPressureScoring(unittest.TestCase):
             json.dump(data, f)
 
     def test_wolf_missed_first_jumps(self):
-        """Each missed FIRST_JUMP adds 15 to signal pressure."""
+        """Each missed FIRST_JUMP (not currently traded) adds 15 to signal pressure."""
         now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         self._write_json("emerging-movers-history.json", [
             {"timestamp": now_ts, "markets": [
-                {"isFirstJump": True}, {"isFirstJump": True}, {"isFirstJump": True}
+                {"isFirstJump": True, "asset": "HYPE"},
+                {"isFirstJump": True, "asset": "SOL"},
+                {"isFirstJump": True, "asset": "WIF"},
             ]}
         ])
         with patch.object(self.signals, "get_instance_workspace", return_value=self.tmpdir), \
@@ -380,6 +439,25 @@ class TestSignalPressureScoring(unittest.TestCase):
             result = self.signals.analyze_wolf_instance("wolf-1", {"slots": 3})
         self.assertEqual(result["missedFirstJumps1h"], 3)
         self.assertEqual(result["signalPressure"], 45)
+
+    def test_wolf_traded_assets_not_counted_as_missed(self):
+        """Signals for assets already in DSL (active or closed) are not missed."""
+        now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self._write_json("emerging-movers-history.json", [
+            {"timestamp": now_ts, "markets": [
+                {"isFirstJump": True, "asset": "HYPE"},
+                {"isFirstJump": True, "asset": "SOL"},
+            ]}
+        ])
+        self._write_json("dsl-HYPE.json", {
+            "active": True, "asset": "HYPE", "direction": "LONG",
+            "entryPrice": 100, "currentPrice": 105, "phase": 1,
+        })
+        with patch.object(self.signals, "get_instance_workspace", return_value=self.tmpdir), \
+             patch.object(self.signals, "get_instance_state_dir", return_value=self.tmpdir):
+            result = self.signals.analyze_wolf_instance("wolf-1", {"slots": 3})
+        self.assertEqual(result["missedFirstJumps1h"], 1)
+        self.assertEqual(result["signalPressure"], 15)
 
     def test_wolf_slots_full_bonus(self):
         """Slots full adds +10 when there's existing pressure."""
@@ -413,15 +491,26 @@ class TestSignalPressureScoring(unittest.TestCase):
         self.assertEqual(result["signalPressure"], 30)
 
     def test_tiger_prescreener_density_bonus(self):
-        """Density >= 25 adds (density - 15) * 5 to pressure."""
+        """Density >= 35 adds (density - 25) * 3 to pressure."""
+        candidates = [{"score": 50} for _ in range(40)]
+        self._write_json("prescreened.json", {"candidates": candidates})
+        with patch.object(self.signals, "get_instance_workspace", return_value=self.tmpdir), \
+             patch.object(self.signals, "get_instance_state_dir", return_value=self.tmpdir):
+            result = self.signals.analyze_tiger_instance("tiger-1", {"maxSlots": 3})
+        self.assertEqual(result["prescreenerDensity"], 40)
+        self.assertEqual(result["highConfluenceCount"], 0)
+        # (40 - 25) * 3 = 45
+        self.assertEqual(result["signalPressure"], 45)
+
+    def test_tiger_normal_density_no_bonus(self):
+        """Density of 30 (normal) should NOT trigger density bonus."""
         candidates = [{"score": 50} for _ in range(30)]
         self._write_json("prescreened.json", {"candidates": candidates})
         with patch.object(self.signals, "get_instance_workspace", return_value=self.tmpdir), \
              patch.object(self.signals, "get_instance_state_dir", return_value=self.tmpdir):
             result = self.signals.analyze_tiger_instance("tiger-1", {"maxSlots": 3})
         self.assertEqual(result["prescreenerDensity"], 30)
-        self.assertEqual(result["highConfluenceCount"], 0)
-        self.assertEqual(result["signalPressure"], 75)
+        self.assertEqual(result["signalPressure"], 0)
 
     def test_pressure_capped_at_100(self):
         """Signal pressure never exceeds 100."""
@@ -434,6 +523,175 @@ class TestSignalPressureScoring(unittest.TestCase):
              patch.object(self.signals, "get_instance_state_dir", return_value=self.tmpdir):
             result = self.signals.analyze_wolf_instance("wolf-1", {"slots": 3})
         self.assertEqual(result["signalPressure"], 100)
+
+
+class TestRegimeClassification(unittest.TestCase):
+    """Regime classifier: ADX/ATR/price-change based market regime detection."""
+
+    def _load_regime(self):
+        return _import_hyphenated(
+            "cobra_regime", os.path.join(SCRIPTS_DIR, "cobra-regime.py"))
+
+    def _make_candles(self, n, base_close=50000, trend_pct=0, volatility=0):
+        """Generate synthetic candles with optional trend and volatility."""
+        candles = []
+        for i in range(n):
+            c = base_close * (1 + trend_pct * i / n)
+            spread = base_close * volatility / 100
+            candles.append({
+                "h": c + spread, "l": c - spread,
+                "c": c, "o": c - spread * 0.5,
+            })
+        return candles
+
+    def test_strong_trending(self):
+        """High ADX + expanding ATR = TRENDING."""
+        regime = self._load_regime()
+        candles = self._make_candles(60, trend_pct=0.10, volatility=2)
+        result = regime.classify_regime(candles, [], 0)
+        self.assertIn(result["regime"], ("TRENDING", "VOLATILE"))
+
+    def test_ranging_low_adx(self):
+        """Flat market with very low movement = RANGING."""
+        regime = self._load_regime()
+        candles = self._make_candles(60, trend_pct=0.0, volatility=0.1)
+        result = regime.classify_regime(candles, [], 0)
+        self.assertEqual(result["regime"], "RANGING")
+
+    def test_volatile_big_price_drop(self):
+        """Large single-candle drop triggers VOLATILE."""
+        regime = self._load_regime()
+        candles = self._make_candles(59, volatility=1)
+        candles.append({"h": 50000, "l": 46000, "c": 46500, "o": 50000})
+        candles_1h = [{"h": 50000, "l": 46000, "c": 46500, "o": 50000},
+                      {"h": 50000, "l": 50000, "c": 50000, "o": 50000}]
+        result = regime.classify_regime(candles, candles_1h, 0)
+        self.assertEqual(result["regime"], "VOLATILE")
+
+    def test_extreme_funding_boosts_volatile_confidence(self):
+        """Extreme funding rate should boost VOLATILE confidence."""
+        regime = self._load_regime()
+        candles = self._make_candles(59, volatility=1)
+        candles.append({"h": 50000, "l": 46000, "c": 46500, "o": 50000})
+        result = regime.classify_regime(candles, [], 0.08)
+        self.assertEqual(result["regime"], "VOLATILE")
+        self.assertGreater(result["confidence"], 0.7)
+
+    def test_allocation_trending(self):
+        regime = self._load_regime()
+        alloc = regime.get_allocation("TRENDING")
+        self.assertEqual(alloc["wolf"], 60)
+        self.assertEqual(alloc["tiger"], 25)
+        self.assertEqual(alloc["reserve"], 15)
+
+    def test_allocation_ranging(self):
+        regime = self._load_regime()
+        alloc = regime.get_allocation("RANGING")
+        self.assertEqual(alloc["wolf"], 20)
+        self.assertEqual(alloc["tiger"], 50)
+
+    def test_allocation_unknown(self):
+        regime = self._load_regime()
+        alloc = regime.get_allocation("UNKNOWN")
+        self.assertEqual(alloc["reserve"], 50)
+
+    def test_zero_candles_returns_zero(self):
+        regime = self._load_regime()
+        self.assertEqual(regime.compute_adx([]), 0)
+        self.assertEqual(regime.compute_atr([]), (0, 0))
+        self.assertEqual(regime.compute_btc_change([]), 0)
+
+
+class TestRegimeHysteresis(unittest.TestCase):
+    """Regime hysteresis prevents flapping on low-confidence transitions."""
+
+    def _load_brain(self):
+        return _import_hyphenated(
+            "cobra_brain", os.path.join(SCRIPTS_DIR, "cobra-brain.py"))
+
+    def test_high_confidence_switches_immediately(self):
+        brain = self._load_brain()
+        state = {"regime": "RANGING"}
+        regime, conf = brain._apply_regime_hysteresis("TRENDING", 0.80, state)
+        self.assertEqual(regime, "TRENDING")
+
+    def test_low_confidence_defers_first_time(self):
+        brain = self._load_brain()
+        state = {"regime": "RANGING"}
+        regime, conf = brain._apply_regime_hysteresis("TRENDING", 0.50, state)
+        self.assertEqual(regime, "RANGING")
+        self.assertEqual(state["_pendingRegime"], "TRENDING")
+
+    def test_low_confidence_confirms_on_second_reading(self):
+        brain = self._load_brain()
+        state = {"regime": "RANGING", "_pendingRegime": "TRENDING"}
+        regime, conf = brain._apply_regime_hysteresis("TRENDING", 0.50, state)
+        self.assertEqual(regime, "TRENDING")
+
+    def test_same_regime_no_change(self):
+        brain = self._load_brain()
+        state = {"regime": "TRENDING"}
+        regime, conf = brain._apply_regime_hysteresis("TRENDING", 0.40, state)
+        self.assertEqual(regime, "TRENDING")
+
+    def test_same_regime_clears_stale_pending(self):
+        """When market confirms current regime, stale _pendingRegime must be cleared."""
+        brain = self._load_brain()
+        state = {"regime": "TRENDING", "_pendingRegime": "MEAN_REVERTING"}
+        regime, conf = brain._apply_regime_hysteresis("TRENDING", 0.50, state)
+        self.assertEqual(regime, "TRENDING")
+        self.assertNotIn("_pendingRegime", state)
+
+    def test_stale_pending_does_not_cause_false_switch(self):
+        """Low-confidence signal matching stale pending must not switch after revert."""
+        brain = self._load_brain()
+        state = {"regime": "TRENDING"}
+        regime, _ = brain._apply_regime_hysteresis("MEAN_REVERTING", 0.40, state)
+        self.assertEqual(regime, "TRENDING")
+        self.assertEqual(state["_pendingRegime"], "MEAN_REVERTING")
+        regime, _ = brain._apply_regime_hysteresis("TRENDING", 0.50, state)
+        self.assertEqual(regime, "TRENDING")
+        self.assertNotIn("_pendingRegime", state)
+        regime, _ = brain._apply_regime_hysteresis("MEAN_REVERTING", 0.40, state)
+        self.assertEqual(regime, "TRENDING")
+
+
+class TestTrappedCapitalAccounting(unittest.TestCase):
+    """Spawn decisions must account for capital trapped in killed wallets."""
+
+    def _load_brain(self):
+        return _import_hyphenated(
+            "cobra_brain", os.path.join(SCRIPTS_DIR, "cobra-brain.py"))
+
+    def _base_config(self, **overrides):
+        cfg = {
+            "totalBudget": 10000, "minSpawnBudget": 500,
+            "maxWolves": 2, "maxTigers": 1, "reservePct": 15,
+            "killVsKeep": {"signalPressureSpawnThreshold": 50},
+        }
+        cfg.update(overrides)
+        return cfg
+
+    def test_trapped_capital_reduces_idle(self):
+        """Killed instances with unrecovered funds reduce available capital."""
+        brain = self._load_brain()
+        import cobra_config
+
+        killed_dir = os.path.join(_TEST_WORKSPACE, "state", "cobra", "spawned")
+        os.makedirs(killed_dir, exist_ok=True)
+        killed_path = os.path.join(killed_dir, "wolf-killed.json")
+        with open(killed_path, "w") as f:
+            json.dump({"status": "killed", "type": "wolf", "budget": 4000,
+                       "finalValue": 3800, "fundsRecovered": False}, f)
+
+        try:
+            regime = {"regime": "TRENDING", "allocation": {"wolf": 60, "tiger": 25, "reserve": 15}}
+            signal = {"globalSignalPressure": 10}
+            spawns = brain._decide_spawns(regime, signal, {}, self._base_config(), {})
+            total_budget = sum(s["budget"] for s in spawns)
+            self.assertLess(total_budget, 5000)
+        finally:
+            os.unlink(killed_path)
 
 
 class TestKillFlowMCPFailure(unittest.TestCase):
@@ -473,8 +731,8 @@ class TestKillFlowMCPFailure(unittest.TestCase):
         finally:
             self._cleanup_instance("tiger-killtest")
 
-    def test_wolf_kill_mcp_down_uses_local_dsl(self):
-        """WOLF kill works without MCP because positions come from local DSL files."""
+    def test_wolf_kill_mcp_down_sets_kill_pending(self):
+        """WOLF kill now uses clearinghouse too — MCP down = kill_pending."""
         self._write_instance("wolf-killtest", {
             "type": "wolf", "instanceId": "wolf-killtest",
             "wallet": "0xfake", "budget": 3000, "status": "active",
@@ -484,9 +742,29 @@ class TestKillFlowMCPFailure(unittest.TestCase):
             with patch.object(self.spawner, "mcporter_call_safe", return_value=None):
                 result = self.spawner.kill_instance("wolf-killtest", reason="test")
             self.assertTrue(result["success"])
-            self.assertEqual(result["killStatus"], "killed")
+            self.assertEqual(result["killStatus"], "kill_pending")
         finally:
             self._cleanup_instance("wolf-killtest")
+
+    def test_clearinghouse_down_preserves_dsl_files(self):
+        """When clearinghouse is unavailable, DSL files must NOT be deactivated."""
+        state_dir = os.path.join(_TEST_WORKSPACE, "state", "tiger-chtest")
+        os.makedirs(state_dir, exist_ok=True)
+        dsl_path = os.path.join(state_dir, "dsl-ETH.json")
+        with open(dsl_path, "w") as f:
+            json.dump({"active": True, "asset": "ETH", "direction": "LONG"}, f)
+        try:
+            with patch.object(self.spawner, "mcporter_call_safe", return_value=None), \
+                 patch.object(self.spawner, "get_instance_state_dir", return_value=state_dir):
+                results, ch = self.spawner._close_positions_via_clearinghouse(
+                    "0xfake", "tiger-chtest", "tiger")
+            self.assertIsNone(ch)
+            self.assertEqual(results, [])
+            with open(dsl_path) as f:
+                state = json.load(f)
+            self.assertTrue(state["active"])
+        finally:
+            shutil.rmtree(state_dir, ignore_errors=True)
 
     def test_kill_with_close_errors_sets_kill_pending(self):
         """When some position closes fail, kill_pending is set for retry."""

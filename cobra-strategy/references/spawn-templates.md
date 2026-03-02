@@ -89,7 +89,10 @@ all the actual work happens inside the subagent's isolated session.
 ### 6. Registration
 
 Instance config is saved to `state/cobra/spawned/{instance-id}.json` with
-the subagent label and wake cron names for lifecycle management.
+`status: "pending_spawn"`, the subagent label, and wake cron names. The brain
+promotes the instance to `status: "active"` once it detects evidence of subagent
+activity (scan files, performance data). If no activity is detected within 30
+minutes, a warning is emitted for manual investigation.
 
 ---
 
@@ -127,8 +130,14 @@ COBRA evaluates each instance every 15 minutes:
 7. **Delete wake crons** — brain tells the agent which OpenClaw crons to remove
 8. **Capital returns** to the master budget — available for redeployment
 
-The kill flow is designed to be resilient: positions are closed via MCP directly
-(not through the subagent), so even if the subagent is unresponsive, capital is safe.
+The kill flow is designed to be resilient: positions are discovered via
+`strategy_get_clearinghouse_state` (on-chain truth, not local files) and closed
+via MCP directly, so even if the subagent is unresponsive or DSL files are missing,
+all positions are found and closed.
+
+After closing, COBRA attempts `strategy_withdraw` to recover funds. If withdrawal
+fails (tool unavailable), the capital is tracked as "trapped" and excluded from
+spawn budgeting to prevent over-deployment.
 
 ### Kill Cost Calculation
 

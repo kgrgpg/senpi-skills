@@ -12,7 +12,7 @@ Usage:
     )
 """
 
-import json, os, sys, glob, subprocess, time, tempfile, shlex
+import json, os, sys, glob, subprocess, time, tempfile, shlex, fcntl
 from datetime import datetime, timezone
 
 WORKSPACE = os.environ.get("COBRA_WORKSPACE",
@@ -148,15 +148,19 @@ def _new_token_budget():
     }
 
 
-def load_spawned_instances(type_filter=None):
-    """Load all spawned instance configs from state/cobra/spawned/.
+def load_spawned_instances(type_filter=None, include_statuses=None):
+    """Load spawned instance configs from state/cobra/spawned/.
 
     Args:
         type_filter: "wolf" or "tiger" to filter. None for all.
+        include_statuses: Set of statuses to include. None means all except
+            "killed". Pass {"active", "pending_spawn", "kill_pending"} to
+            be explicit.
 
     Returns:
         Dict of instance_id -> spawn config.
     """
+    exclude = {"killed"}
     instances = {}
     if not os.path.isdir(SPAWNED_DIR):
         return instances
@@ -166,13 +170,36 @@ def load_spawned_instances(type_filter=None):
         try:
             with open(os.path.join(SPAWNED_DIR, fname)) as f:
                 data = json.load(f)
-            if data.get("status") in ("killed",):
+            status = data.get("status", "")
+            if include_statuses is not None:
+                if status not in include_statuses:
+                    continue
+            elif status in exclude:
                 continue
             itype = data.get("type", "")
             if type_filter and itype != type_filter:
                 continue
             instance_id = fname.replace(".json", "")
             instances[instance_id] = data
+        except (json.JSONDecodeError, IOError):
+            continue
+    return instances
+
+
+def load_killed_instances():
+    """Load killed instance configs that still have unrecovered funds."""
+    instances = {}
+    if not os.path.isdir(SPAWNED_DIR):
+        return instances
+    for fname in os.listdir(SPAWNED_DIR):
+        if not fname.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(SPAWNED_DIR, fname)) as f:
+                data = json.load(f)
+            if data.get("status") == "killed" and not data.get("fundsRecovered"):
+                instance_id = fname.replace(".json", "")
+                instances[instance_id] = data
         except (json.JSONDecodeError, IOError):
             continue
     return instances
@@ -224,46 +251,26 @@ def mcporter_call(tool, retries=3, timeout=30, **kwargs):
             args.append(f"{k}={v}")
 
     mcporter_bin = os.environ.get("MCPORTER_CMD", "mcporter")
-    cmd_str = " ".join(
-        [shlex.quote(mcporter_bin), "call", shlex.quote(f"senpi.{tool}")]
-        + [shlex.quote(a) for a in args]
-    )
+    cmd = [mcporter_bin, "call", f"senpi.{tool}"] + args
     last_error = None
     last_stderr = None
 
     for attempt in range(retries):
-        fd, tmp = None, None
-        fd_err, tmp_err = None, None
         try:
-            fd, tmp = tempfile.mkstemp(suffix=".json")
-            os.close(fd)
-            fd_err, tmp_err = tempfile.mkstemp(suffix=".stderr")
-            os.close(fd_err)
-            subprocess.run(
-                f"{cmd_str} > {tmp} 2>{tmp_err}",
-                shell=True, timeout=timeout,
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout,
             )
-            with open(tmp) as f:
-                d = json.load(f)
+            d = json.loads(proc.stdout)
             if d.get("success"):
                 return d.get("data", {})
             last_error = d.get("error", d)
-            try:
-                with open(tmp_err) as ef:
-                    last_stderr = ef.read().strip() or None
-            except OSError:
-                pass
+            last_stderr = proc.stderr.strip() or None
         except (json.JSONDecodeError, subprocess.TimeoutExpired, OSError) as e:
             last_error = str(e)
             try:
-                with open(tmp_err) as ef:
-                    last_stderr = ef.read().strip() or None
-            except (OSError, TypeError):
+                last_stderr = proc.stderr.strip() or None
+            except (UnboundLocalError, AttributeError):
                 pass
-        finally:
-            for p in (tmp, tmp_err):
-                if p and os.path.exists(p):
-                    os.unlink(p)
         if attempt < retries - 1:
             time.sleep(3)
 
@@ -284,12 +291,24 @@ def mcporter_call_safe(tool, retries=3, timeout=30, **kwargs):
 # --- Utility functions ---
 
 def atomic_write(path, data):
-    """Atomically write JSON data to a file."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, path)
+    """Atomically write JSON data to a file.
+
+    Uses a unique temp file in the same directory so concurrent writers
+    don't clobber each other's .tmp files before os.replace.
+    """
+    dirpath = os.path.dirname(path)
+    os.makedirs(dirpath, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=dirpath, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def utc_now():
@@ -312,6 +331,36 @@ def load_json_safe(path):
             return json.load(f)
     except Exception:
         return None
+
+
+def locked_read_modify_write(path, modify_fn):
+    """Atomically read-modify-write a JSON file under an exclusive lock.
+
+    ``modify_fn(data)`` receives the current data (or {} if file is missing)
+    and must return the updated data to save.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    lock_path = path + ".lock"
+    fd_lock = open(lock_path, "w")
+    try:
+        fcntl.flock(fd_lock, fcntl.LOCK_EX)
+        data = load_json_safe(path) or {}
+        updated = modify_fn(data)
+        atomic_write(path, updated)
+    finally:
+        fcntl.flock(fd_lock, fcntl.LOCK_UN)
+        fd_lock.close()
+
+
+def minutes_since(iso_timestamp):
+    """Return minutes elapsed since an ISO timestamp, or 9999 if unparseable."""
+    if not iso_timestamp:
+        return 9999
+    try:
+        ts = datetime.fromisoformat(iso_timestamp.replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - ts).total_seconds() / 60
+    except Exception:
+        return 9999
 
 
 def _log(msg):

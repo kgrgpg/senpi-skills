@@ -54,7 +54,11 @@ def hours_ago(iso_timestamp, hours):
 
 
 def analyze_wolf_instance(instance_id, instance_data):
-    """Analyze signal pressure for a WOLF instance."""
+    """Analyze signal pressure for a WOLF instance.
+
+    Cross-references signals with active DSL positions to avoid counting
+    signals that were successfully traded as "missed."
+    """
     workspace = get_instance_workspace(instance_id, "wolf")
     state_dir = get_instance_state_dir(instance_id, "wolf")
 
@@ -71,7 +75,49 @@ def analyze_wolf_instance(instance_id, instance_data):
         "avgPositionROE": 0,
     }
 
+    # --- Read DSL state files first (need traded assets for cross-reference) ---
+    dsl_pattern = os.path.join(state_dir, "dsl-*.json")
+    dsl_files = glob.glob(dsl_pattern)
+    roe_values = []
+    traded_assets = set()
+
+    for dsl_path in dsl_files:
+        state = load_json_safe(dsl_path)
+        if not state:
+            continue
+        asset = state.get("asset", "")
+        if state.get("active"):
+            result["slotsUsed"] += 1
+            traded_assets.add(asset.upper())
+
+            tier_idx = state.get("currentTierIndex")
+            phase = state.get("phase", 1)
+            if phase == 1 or tier_idx is None:
+                result["positionQuality"]["phase1"] += 1
+            elif tier_idx == 0:
+                result["positionQuality"]["tier1"] += 1
+            else:
+                result["positionQuality"]["tier2plus"] += 1
+
+            entry = float(state.get("entryPrice", 0))
+            current = float(state.get("currentPrice", state.get("lastPrice", 0)))
+            if current == 0:
+                current = float(state.get("highWaterPrice", 0))
+            direction = state.get("direction", "LONG")
+            if entry > 0 and current > 0:
+                if direction == "LONG":
+                    roe = (current - entry) / entry * 100
+                else:
+                    roe = (entry - current) / entry * 100
+                roe_values.append(roe)
+        elif asset:
+            traded_assets.add(asset.upper())
+
+    if roe_values:
+        result["avgPositionROE"] = round(sum(roe_values) / len(roe_values), 2)
+
     # --- Read emerging-movers-history.json ---
+    # Exclude signals for assets already being traded (active or recently closed DSL)
     em_history_path = _find_scan_file(workspace, "emerging-movers-history.json")
     em_history = load_json_safe(em_history_path)
     if isinstance(em_history, list):
@@ -82,17 +128,21 @@ def analyze_wolf_instance(instance_id, instance_data):
             markets = scan.get("markets", scan.get("ranked", []))
             for m in markets:
                 is_first_jump = m.get("isFirstJump") or m.get("firstJump")
-                is_explosion = m.get("isContribExplosion")
-                if is_first_jump:
-                    if hours_ago(scan_time, 1):
-                        result["missedFirstJumps1h"] += 1
-                    if hours_ago(scan_time, 4):
-                        result["missedFirstJumps4h"] += 1
+                if not is_first_jump:
+                    continue
+                asset = (m.get("asset") or m.get("coin") or m.get("symbol") or "").upper()
+                if asset in traded_assets:
+                    continue
+                if hours_ago(scan_time, 1):
+                    result["missedFirstJumps1h"] += 1
+                if hours_ago(scan_time, 4):
+                    result["missedFirstJumps4h"] += 1
 
     # --- Read scan-history.json (opportunity scanner) ---
     scan_history_path = _find_scan_file(workspace, "scan-history.json")
     scan_history = load_json_safe(scan_history_path)
     if isinstance(scan_history, list):
+        seen_assets_1h = set()
         for scan in scan_history:
             scan_time = scan.get("timestamp") or scan.get("time")
             if not scan_time:
@@ -101,46 +151,13 @@ def analyze_wolf_instance(instance_id, instance_data):
             slots_available = scan.get("anySlotsAvailable", True)
             for opp in opportunities:
                 score = opp.get("finalScore", opp.get("score", 0))
-                if score >= 175 and not slots_available:
-                    if hours_ago(scan_time, 1):
+                asset = (opp.get("asset") or opp.get("coin") or "").upper()
+                if score >= 175 and not slots_available and asset not in traded_assets:
+                    if hours_ago(scan_time, 1) and asset not in seen_assets_1h:
                         result["missedOpportunities1h"] += 1
+                        seen_assets_1h.add(asset)
                     if hours_ago(scan_time, 4):
                         result["missedOpportunities4h"] += 1
-
-    # --- Read DSL state files for position quality ---
-    dsl_pattern = os.path.join(state_dir, "dsl-*.json")
-    dsl_files = glob.glob(dsl_pattern)
-    roe_values = []
-
-    for dsl_path in dsl_files:
-        state = load_json_safe(dsl_path)
-        if not state or not state.get("active"):
-            continue
-        result["slotsUsed"] += 1
-
-        tier_idx = state.get("currentTierIndex")
-        phase = state.get("phase", 1)
-        if phase == 1 or tier_idx is None:
-            result["positionQuality"]["phase1"] += 1
-        elif tier_idx == 0:
-            result["positionQuality"]["tier1"] += 1
-        else:
-            result["positionQuality"]["tier2plus"] += 1
-
-        entry = float(state.get("entryPrice", 0))
-        current = float(state.get("currentPrice", state.get("lastPrice", 0)))
-        if current == 0:
-            current = float(state.get("highWaterPrice", 0))
-        direction = state.get("direction", "LONG")
-        if entry > 0 and current > 0:
-            if direction == "LONG":
-                roe = (current - entry) / entry * 100
-            else:
-                roe = (entry - current) / entry * 100
-            roe_values.append(roe)
-
-    if roe_values:
-        result["avgPositionROE"] = round(sum(roe_values) / len(roe_values), 2)
 
     # --- Compute signal pressure score ---
     pressure = 0
@@ -253,10 +270,12 @@ def analyze_tiger_instance(instance_id, instance_data):
             result["positionQuality"]["tier2plus"] += 1
 
     # --- Compute signal pressure score ---
+    # Density bonus uses a higher threshold (35) and gentler multiplier (3)
+    # so normal candidate counts (20-30) don't inflate pressure.
     pressure = 0
     pressure += result["highConfluenceCount"] * 10
-    if result["prescreenerDensity"] >= 25:
-        pressure += (result["prescreenerDensity"] - 15) * 5
+    if result["prescreenerDensity"] >= 35:
+        pressure += (result["prescreenerDensity"] - 25) * 3
     if result["slotsUsed"] >= result["slotsMax"] and result["prescreenerDensity"] > 0:
         pressure += 15
     if result["aggression"] in ("ELEVATED", "ABORT"):
