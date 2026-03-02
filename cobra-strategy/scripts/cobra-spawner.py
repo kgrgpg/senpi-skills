@@ -260,7 +260,12 @@ def _create_and_fund_wallet(budget, name, config=None):
     the orphaned strategy if funding fails.
     """
     try:
-        create_result = mcporter_call("strategy_create_custom_strategy", name=name)
+        create_result = mcporter_call(
+            "strategy_create_custom_strategy",
+            name=name,
+            initialBudget=budget,
+            positions=[{"asset": "BTC"}],
+        )
         wallet = create_result.get("wallet", create_result.get("address", ""))
         strategy_uuid = create_result.get("strategyId", create_result.get("id", ""))
     except RuntimeError as e:
@@ -269,12 +274,21 @@ def _create_and_fund_wallet(budget, name, config=None):
     if not wallet:
         return {"success": False, "error": "No wallet returned from strategy creation"}
 
-    try:
-        mcporter_call("strategy_top_up", amount=budget, strategyId=strategy_uuid)
-    except RuntimeError as e:
-        mcporter_call_safe("strategy_delete", strategyId=strategy_uuid)
-        return {"success": False, "error": f"Failed to fund strategy: {e}",
-                "wallet": wallet, "strategyId": strategy_uuid}
+    # Check if creation already funded the wallet (initialBudget may or may not
+    # transfer funds depending on MCP version). Only top up if needed.
+    verify_ch = mcporter_call_safe("strategy_get_clearinghouse_state", wallet=wallet)
+    current_value = 0
+    if verify_ch:
+        current_value = float(verify_ch.get("accountValue", verify_ch.get("equity", 0)))
+
+    if current_value < budget * 0.95:
+        top_up_amount = budget - current_value
+        try:
+            mcporter_call("strategy_top_up", amount=top_up_amount, strategyId=strategy_uuid)
+        except RuntimeError as e:
+            mcporter_call_safe("strategy_delete", strategyId=strategy_uuid)
+            return {"success": False, "error": f"Failed to fund strategy: {e}",
+                    "wallet": wallet, "strategyId": strategy_uuid}
 
     verify_ch = mcporter_call_safe("strategy_get_clearinghouse_state", wallet=wallet)
     if verify_ch:

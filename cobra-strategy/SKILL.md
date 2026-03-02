@@ -301,8 +301,10 @@ All writes are atomic (write to `.tmp`, then `os.replace`). Full schemas: [refer
 | Issue | Cause | Fix |
 |-------|-------|-----|
 | Brain outputs empty decisions | No spawned instances | Wait for first spawn or check config budget |
-| Signal pressure always 0 | No scan history files | WOLF/TIGER instances haven't run scanners yet |
-| Spawn fails | MCP connection issue | Check `mcporter list`, retry |
+| Signal pressure always 0 | No scan history files | Bootstrap mode scans shared workspace; if still 0, run a manual WOLF/TIGER scan |
+| Spawn fails with missing params | MCP requires `initialBudget` + `positions` | Already fixed — spawner passes both params to `strategy_create_custom_strategy` |
+| Wrong strategy spawned first | Small budget + regime mismatch | Spawn priority now follows regime allocation (TIGER first in RANGING, WOLF first in TRENDING) |
 | Kill fails to close positions | Positions already closed | Check clearinghouse state; spawner handles gracefully |
 | Token budget exceeded | Too many spawned crons | Reduce maxWolves/maxTigers or increase dailyLimitTokens |
 | Regime stuck at UNKNOWN | No BTC data from MCP | Check `market_get_asset_data` availability |
+| Signal scanner crashes | Unhandled exception | Now wrapped in try/except — outputs error JSON instead of crashing |

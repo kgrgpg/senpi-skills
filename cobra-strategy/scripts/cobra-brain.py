@@ -301,35 +301,53 @@ def _decide_spawns(regime_data, signal_data, state, config, current_instances):
     tiger_allocated = sum(v.get("budget", 0)
                           for v in countable.values() if v.get("type") == "tiger")
 
-    # Spawn WOLF if under-allocated and under limit
+    # Build spawn candidates, then sort by allocation priority so the
+    # regime-favored strategy type gets first claim on limited capital.
+    candidates = []
+
     if (wolf_allocated < wolf_target_budget and
             active_wolves < max_wolves and idle_capital >= min_spawn):
         wolf_budget = min(wolf_target_budget - wolf_allocated, idle_capital * 0.6)
         wolf_budget = max(min_spawn, round(wolf_budget, 2))
         if wolf_budget <= idle_capital:
             preset = "aggressive" if regime == "TRENDING" else "conservative"
-            spawns.append({
+            candidates.append({
                 "type": "wolf",
                 "budget": wolf_budget,
                 "dslPreset": preset,
+                "allocationPct": wolf_target_pct,
                 "reason": f"Wolf under-allocated (${wolf_allocated:.0f}/${wolf_target_budget:.0f}), "
                           f"regime={regime}, signal_pressure={global_pressure}",
             })
-            idle_capital -= wolf_budget
 
-    # Spawn TIGER if under-allocated and under limit
     if (tiger_allocated < tiger_target_budget and
             active_tigers < max_tigers and idle_capital >= min_spawn):
         tiger_budget = min(tiger_target_budget - tiger_allocated, idle_capital * 0.7)
         tiger_budget = max(min_spawn, round(tiger_budget, 2))
         if tiger_budget <= idle_capital:
-            spawns.append({
+            candidates.append({
                 "type": "tiger",
                 "budget": tiger_budget,
                 "goalPct": 5 if regime in ("TRENDING", "VOLATILE") else 3,
+                "allocationPct": tiger_target_pct,
                 "reason": f"Tiger under-allocated (${tiger_allocated:.0f}/${tiger_target_budget:.0f}), "
                           f"regime={regime}",
             })
+
+    # Higher allocation % spawns first (e.g. TIGER before WOLF in RANGING)
+    candidates.sort(key=lambda c: c["allocationPct"], reverse=True)
+
+    for c in candidates:
+        if idle_capital < min_spawn:
+            break
+        c_budget = min(c["budget"], idle_capital)
+        c_budget = max(min_spawn, round(c_budget, 2))
+        if c_budget > idle_capital:
+            continue
+        c.pop("allocationPct", None)
+        c["budget"] = c_budget
+        spawns.append(c)
+        idle_capital -= c_budget
 
     return spawns
 

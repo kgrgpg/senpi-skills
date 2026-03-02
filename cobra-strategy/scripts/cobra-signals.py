@@ -287,17 +287,114 @@ def analyze_tiger_instance(instance_id, instance_data):
     return result
 
 
+def _bootstrap_signal_scan():
+    """Scan shared workspace for signal data when no instances exist yet.
+
+    Reads any emerging-movers-history, scan-history, and prescreened files
+    that may exist from manual scans or previous strategies, giving COBRA
+    market awareness before the first instance spawns.
+    """
+    shared_ws = get_shared_workspace()
+    result = {
+        "type": "bootstrap",
+        "signalPressure": 0,
+        "missedFirstJumps1h": 0,
+        "missedOpportunities1h": 0,
+        "highConfluenceCount": 0,
+        "prescreenerDensity": 0,
+    }
+
+    em_data = load_json_safe(os.path.join(shared_ws, "emerging-movers-history.json"))
+    if isinstance(em_data, list):
+        for scan in em_data:
+            scan_time = scan.get("timestamp") or scan.get("time")
+            if not scan_time:
+                continue
+            markets = scan.get("markets", scan.get("ranked", []))
+            for m in markets:
+                if (m.get("isFirstJump") or m.get("firstJump")) and hours_ago(scan_time, 1):
+                    result["missedFirstJumps1h"] += 1
+
+    scan_data = load_json_safe(os.path.join(shared_ws, "scan-history.json"))
+    if isinstance(scan_data, list):
+        seen = set()
+        for scan in scan_data:
+            scan_time = scan.get("timestamp") or scan.get("time")
+            if not scan_time or not hours_ago(scan_time, 1):
+                continue
+            for opp in scan.get("opportunities", scan.get("results", [])):
+                score = opp.get("finalScore", opp.get("score", 0))
+                asset = (opp.get("asset") or opp.get("coin") or "").upper()
+                if score >= 175 and asset not in seen:
+                    result["missedOpportunities1h"] += 1
+                    seen.add(asset)
+
+    ps_data = load_json_safe(os.path.join(shared_ws, "prescreened.json"))
+    candidates = []
+    if isinstance(ps_data, dict):
+        candidates = ps_data.get("candidates", ps_data.get("results", []))
+    elif isinstance(ps_data, list):
+        candidates = ps_data
+    if isinstance(candidates, list):
+        result["prescreenerDensity"] = len(candidates)
+        scores = [float(c.get("score", c.get("totalScore", 0)))
+                  for c in candidates if c.get("score") or c.get("totalScore")]
+        result["highConfluenceCount"] = sum(1 for s in scores if s >= 65)
+
+    pressure = 0
+    pressure += result["missedFirstJumps1h"] * 15
+    pressure += result["missedOpportunities1h"] * 8
+    pressure += result["highConfluenceCount"] * 10
+    if result["prescreenerDensity"] >= 35:
+        pressure += (result["prescreenerDensity"] - 25) * 3
+    result["signalPressure"] = min(100, pressure)
+    return result
+
+
+def _pressure_to_density(pressure):
+    if pressure >= 60:
+        return "HIGH"
+    if pressure >= 30:
+        return "MODERATE"
+    if pressure > 0:
+        return "LOW"
+    return "NONE"
+
+
 def run():
     """Main: scan all spawned instances, compute signal pressure, save results."""
+    try:
+        _run_inner()
+    except Exception as e:
+        error_result = {
+            "instances": {},
+            "globalSignalPressure": 0,
+            "marketOpportunityDensity": "ERROR",
+            "error": str(e),
+            "updatedAt": utc_now(),
+            "actionable": 0,
+        }
+        try:
+            atomic_write(SIGNAL_PRESSURE_FILE, error_result)
+        except Exception:
+            pass
+        from cobra_config import output as _output
+        _output(error_result)
+
+
+def _run_inner():
     instances = load_spawned_instances()
 
     if not instances:
+        bootstrap = _bootstrap_signal_scan()
+        global_pressure = bootstrap["signalPressure"]
         result = {
-            "instances": {},
-            "globalSignalPressure": 0,
-            "marketOpportunityDensity": "NONE",
-            "actionable": 0,
-            "heartbeat": "HEARTBEAT_OK",
+            "instances": {"_bootstrap": bootstrap},
+            "globalSignalPressure": global_pressure,
+            "marketOpportunityDensity": _pressure_to_density(global_pressure),
+            "bootstrapMode": True,
+            "updatedAt": utc_now(),
+            "actionable": 1 if global_pressure >= 40 else 0,
         }
         atomic_write(SIGNAL_PRESSURE_FILE, result)
         from viper_gate import output_and_track
@@ -320,19 +417,10 @@ def run():
 
     global_pressure = max(all_pressures) if all_pressures else 0
 
-    if global_pressure >= 60:
-        density = "HIGH"
-    elif global_pressure >= 30:
-        density = "MODERATE"
-    elif global_pressure > 0:
-        density = "LOW"
-    else:
-        density = "NONE"
-
     result = {
         "instances": results,
         "globalSignalPressure": global_pressure,
-        "marketOpportunityDensity": density,
+        "marketOpportunityDensity": _pressure_to_density(global_pressure),
         "updatedAt": utc_now(),
         "actionable": 1 if global_pressure >= 40 else 0,
     }

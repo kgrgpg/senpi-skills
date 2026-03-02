@@ -453,6 +453,52 @@ class TestSpawnDecisions(unittest.TestCase):
                            "Should spawn wolf since kill_pending freed a slot")
 
 
+class TestSpawnPriority(unittest.TestCase):
+    """Regime-based spawn priority: higher allocation spawns first."""
+
+    def _load_brain(self):
+        return _import_hyphenated(
+            "cobra_brain", os.path.join(SCRIPTS_DIR, "cobra-brain.py"))
+
+    def _base_config(self, **overrides):
+        cfg = {
+            "totalBudget": 1000, "minSpawnBudget": 500,
+            "maxWolves": 2, "maxTigers": 1, "reservePct": 15,
+            "killVsKeep": {"signalPressureSpawnThreshold": 50},
+        }
+        cfg.update(overrides)
+        return cfg
+
+    def test_ranging_spawns_tiger_first_small_budget(self):
+        """With $1000 budget in RANGING, tiger (50%) should spawn, not wolf (20%)."""
+        brain = self._load_brain()
+        regime = {"regime": "RANGING", "allocation": {"wolf": 20, "tiger": 50, "reserve": 30}}
+        signal = {"globalSignalPressure": 10}
+        spawns = brain._decide_spawns(regime, signal, {}, self._base_config(), {})
+        self.assertEqual(len(spawns), 1)
+        self.assertEqual(spawns[0]["type"], "tiger")
+
+    def test_trending_spawns_wolf_first_small_budget(self):
+        """With $1000 budget in TRENDING, wolf (60%) should spawn, not tiger (25%)."""
+        brain = self._load_brain()
+        regime = {"regime": "TRENDING", "allocation": {"wolf": 60, "tiger": 25, "reserve": 15}}
+        signal = {"globalSignalPressure": 10}
+        spawns = brain._decide_spawns(regime, signal, {}, self._base_config(), {})
+        self.assertEqual(len(spawns), 1)
+        self.assertEqual(spawns[0]["type"], "wolf")
+
+    def test_large_budget_spawns_both(self):
+        """With sufficient capital, both types should spawn."""
+        brain = self._load_brain()
+        regime = {"regime": "TRENDING", "allocation": {"wolf": 60, "tiger": 25, "reserve": 15}}
+        signal = {"globalSignalPressure": 10}
+        spawns = brain._decide_spawns(
+            regime, signal, {}, self._base_config(totalBudget=10000), {})
+        types = {s["type"] for s in spawns}
+        self.assertIn("wolf", types)
+        self.assertIn("tiger", types)
+
+
 class TestKillVsKeepNetScore(unittest.TestCase):
     """Net score should be returned for debugging transparency."""
 
@@ -597,6 +643,82 @@ class TestSignalPressureScoring(unittest.TestCase):
              patch.object(self.signals, "get_instance_state_dir", return_value=self.tmpdir):
             result = self.signals.analyze_wolf_instance("wolf-1", {"slots": 3})
         self.assertEqual(result["signalPressure"], 100)
+
+
+class TestBootstrapSignalScan(unittest.TestCase):
+    """Bootstrap scanning reads shared workspace when no instances exist."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="cobra-bootstrap-test-")
+        self.signals = _import_hyphenated(
+            "cobra_signals", os.path.join(SCRIPTS_DIR, "cobra-signals.py"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _write_json(self, filename, data):
+        path = os.path.join(self.tmpdir, filename)
+        with open(path, "w") as f:
+            json.dump(data, f)
+
+    def test_empty_workspace_returns_zero(self):
+        with patch.object(self.signals, "get_shared_workspace", return_value=self.tmpdir):
+            result = self.signals._bootstrap_signal_scan()
+        self.assertEqual(result["signalPressure"], 0)
+        self.assertEqual(result["type"], "bootstrap")
+
+    def test_reads_emerging_movers_from_shared(self):
+        now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self._write_json("emerging-movers-history.json", [
+            {"timestamp": now_ts, "markets": [
+                {"isFirstJump": True, "asset": "HYPE"},
+                {"isFirstJump": True, "asset": "SOL"},
+            ]}
+        ])
+        with patch.object(self.signals, "get_shared_workspace", return_value=self.tmpdir):
+            result = self.signals._bootstrap_signal_scan()
+        self.assertEqual(result["missedFirstJumps1h"], 2)
+        self.assertEqual(result["signalPressure"], 30)
+
+    def test_reads_prescreened_from_shared(self):
+        candidates = [{"score": 75}, {"score": 80}, {"score": 50}]
+        self._write_json("prescreened.json", {"candidates": candidates})
+        with patch.object(self.signals, "get_shared_workspace", return_value=self.tmpdir):
+            result = self.signals._bootstrap_signal_scan()
+        self.assertEqual(result["highConfluenceCount"], 2)
+        self.assertEqual(result["signalPressure"], 20)
+
+    def test_run_bootstrap_mode_output(self):
+        """run() in bootstrap mode sets bootstrapMode flag."""
+        now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self._write_json("emerging-movers-history.json", [
+            {"timestamp": now_ts, "markets": [{"isFirstJump": True}]}
+        ])
+        with patch.object(self.signals, "load_spawned_instances", return_value={}), \
+             patch.object(self.signals, "get_shared_workspace", return_value=self.tmpdir), \
+             patch.object(self.signals, "SIGNAL_PRESSURE_FILE",
+                          os.path.join(self.tmpdir, "cobra-signals.json")), \
+             patch("viper_gate.output_and_track"):
+            self.signals._run_inner()
+        result = json.load(open(os.path.join(self.tmpdir, "cobra-signals.json")))
+        self.assertTrue(result.get("bootstrapMode"))
+        self.assertIn("_bootstrap", result["instances"])
+
+    def test_run_error_handling(self):
+        """run() should catch exceptions and output error JSON."""
+        captured = {}
+
+        def fake_output(data):
+            captured["data"] = data
+
+        with patch.object(self.signals, "load_spawned_instances",
+                          side_effect=RuntimeError("test error")), \
+             patch("cobra_config.output", fake_output), \
+             patch.object(self.signals, "SIGNAL_PRESSURE_FILE",
+                          os.path.join(self.tmpdir, "cobra-signals.json")):
+            self.signals.run()
+        self.assertIn("error", captured["data"])
+        self.assertEqual(captured["data"]["globalSignalPressure"], 0)
 
 
 class TestRegimeClassification(unittest.TestCase):
