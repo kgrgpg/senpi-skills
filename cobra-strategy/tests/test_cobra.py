@@ -551,11 +551,11 @@ class TestSlotExpansion(unittest.TestCase):
         self.assertGreater(expansions[0]["newMarginPerSlot"], 0)
 
     def test_no_expand_low_pressure(self):
-        """Pressure < 60 should not trigger expansion."""
+        """Pressure < 40 should not trigger expansion."""
         brain = self._load_brain()
         signal = {
             "instances": {
-                "wolf-lo": {"signalPressure": 40, "slotsUsed": 2, "slotsMax": 2},
+                "wolf-lo": {"signalPressure": 30, "slotsUsed": 2, "slotsMax": 2},
             },
         }
         perf = {"instances": {"wolf-lo": {"accountValue": 500, "utilization": 50}}}
@@ -630,6 +630,50 @@ class TestSlotExpansion(unittest.TestCase):
         self.assertEqual(expansions[0]["newSlots"], 4)
         expected_margin = round(6000 * 0.30 / 4, 2)
         self.assertEqual(expansions[0]["newMarginPerSlot"], expected_margin)
+
+
+    def test_aggressive_expansion_two_slots(self):
+        """Pressure >= 80 should expand by +2 slots."""
+        brain = self._load_brain()
+        signal = {
+            "instances": {
+                "wolf-agg": {"signalPressure": 85, "slotsUsed": 2, "slotsMax": 2},
+            },
+        }
+        perf = {"instances": {"wolf-agg": {"accountValue": 500, "utilization": 50}}}
+        instances = {"wolf-agg": {"type": "wolf", "status": "active", "budget": 500, "slots": 2}}
+        expansions = brain._decide_expansions(signal, perf, self._base_config(), instances)
+        self.assertEqual(len(expansions), 1)
+        self.assertEqual(expansions[0]["newSlots"], 4)
+
+    def test_monitor_position_count_fallback(self):
+        """When signal slotsUsed=0 but monitor shows 2 positions, use monitor data."""
+        brain = self._load_brain()
+        signal = {
+            "instances": {
+                "wolf-mon": {"signalPressure": 50, "slotsUsed": 0, "slotsMax": 2},
+            },
+        }
+        perf = {"instances": {
+            "wolf-mon": {"accountValue": 500, "utilization": 60, "positionCount": 2},
+        }}
+        instances = {"wolf-mon": {"type": "wolf", "status": "active", "budget": 500, "slots": 2}}
+        expansions = brain._decide_expansions(signal, perf, self._base_config(), instances)
+        self.assertEqual(len(expansions), 1)
+
+    def test_moderate_pressure_triggers_expansion(self):
+        """Pressure 40-59 should trigger expansion (lowered threshold)."""
+        brain = self._load_brain()
+        signal = {
+            "instances": {
+                "wolf-mod": {"signalPressure": 45, "slotsUsed": 2, "slotsMax": 2},
+            },
+        }
+        perf = {"instances": {"wolf-mod": {"accountValue": 500, "utilization": 50}}}
+        instances = {"wolf-mod": {"type": "wolf", "status": "active", "budget": 500, "slots": 2}}
+        expansions = brain._decide_expansions(signal, perf, self._base_config(), instances)
+        self.assertEqual(len(expansions), 1)
+        self.assertEqual(expansions[0]["newSlots"], 3)
 
 
 class TestRebalanceDecisions(unittest.TestCase):
@@ -708,7 +752,7 @@ class TestRebalanceDecisions(unittest.TestCase):
         self.assertEqual(len(rebs), 0)
 
     def test_no_rebalance_recently_spawned(self):
-        """Instance alive < 2 hours should not be rebalanced."""
+        """Instance alive < 1 hour should not be rebalanced."""
         brain = self._load_brain()
         from cobra_config import utc_now
         signal = {
@@ -765,6 +809,98 @@ class TestRebalanceDecisions(unittest.TestCase):
             signal, perf, self._base_config(minSpawnBudget=500), instances)
         if rebs:
             self.assertLessEqual(rebs[0]["amount"], 400)
+
+
+class TestSaturationPressure(unittest.TestCase):
+    """Slot saturation generates signal pressure even without scan history files."""
+
+    def _load_signals(self):
+        return _import_hyphenated(
+            "cobra_signals", os.path.join(SCRIPTS_DIR, "cobra-signals.py"))
+
+    def test_full_slots_generate_base_pressure(self):
+        """2/2 slots used should produce pressure >= 25 even with no history files."""
+        signals = self._load_signals()
+        tmpdir = tempfile.mkdtemp()
+        instance_id = "wolf-sat1"
+        instance_data = {"type": "wolf", "slots": 2}
+
+        os.makedirs(tmpdir, exist_ok=True)
+        for asset in ("ZEC", "ENA"):
+            with open(os.path.join(tmpdir, f"dsl-{asset}.json"), "w") as f:
+                json.dump({"asset": asset, "active": True, "entryPrice": 100,
+                           "currentPrice": 101, "direction": "SHORT"}, f)
+
+        try:
+            with patch.object(signals, "SIGNAL_PRESSURE_FILE",
+                              os.path.join(tmpdir, "signals.json")), \
+                 patch.object(signals, "get_instance_workspace", return_value=tmpdir), \
+                 patch.object(signals, "get_instance_state_dir", return_value=tmpdir):
+                result = signals.analyze_wolf_instance(instance_id, instance_data)
+            self.assertEqual(result["slotsUsed"], 2)
+            self.assertGreaterEqual(result["signalPressure"], 25)
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_saturation_cycles_escalate(self):
+        """Consecutive full-slot cycles should increase pressure."""
+        signals = self._load_signals()
+        tmpdir = tempfile.mkdtemp()
+        instance_id = "wolf-sat2"
+        instance_data = {"type": "wolf", "slots": 2}
+
+        os.makedirs(tmpdir, exist_ok=True)
+        for asset in ("ZEC", "ENA"):
+            with open(os.path.join(tmpdir, f"dsl-{asset}.json"), "w") as f:
+                json.dump({"asset": asset, "active": True, "entryPrice": 100,
+                           "currentPrice": 101, "direction": "SHORT"}, f)
+
+        prev_signals = {
+            "instances": {instance_id: {"_saturatedCycles": 4}},
+        }
+        prev_file = os.path.join(tmpdir, "signals.json")
+        with open(prev_file, "w") as f:
+            json.dump(prev_signals, f)
+
+        try:
+            with patch.object(signals, "SIGNAL_PRESSURE_FILE", prev_file), \
+                 patch.object(signals, "get_instance_workspace", return_value=tmpdir), \
+                 patch.object(signals, "get_instance_state_dir", return_value=tmpdir):
+                result = signals.analyze_wolf_instance(instance_id, instance_data)
+            self.assertEqual(result["_saturatedCycles"], 5)
+            self.assertGreaterEqual(result["signalPressure"], 45)
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_empty_slots_reset_saturation(self):
+        """When slots free up, saturation cycle counter resets to 0."""
+        signals = self._load_signals()
+        tmpdir = tempfile.mkdtemp()
+        instance_id = "wolf-sat3"
+        instance_data = {"type": "wolf", "slots": 2}
+
+        os.makedirs(tmpdir, exist_ok=True)
+        with open(os.path.join(tmpdir, "dsl-ZEC.json"), "w") as f:
+            json.dump({"asset": "ZEC", "active": True, "entryPrice": 100,
+                       "currentPrice": 101, "direction": "SHORT"}, f)
+
+        prev_signals = {
+            "instances": {instance_id: {"_saturatedCycles": 6}},
+        }
+        prev_file = os.path.join(tmpdir, "signals.json")
+        with open(prev_file, "w") as f:
+            json.dump(prev_signals, f)
+
+        try:
+            with patch.object(signals, "SIGNAL_PRESSURE_FILE", prev_file), \
+                 patch.object(signals, "get_instance_workspace", return_value=tmpdir), \
+                 patch.object(signals, "get_instance_state_dir", return_value=tmpdir):
+                result = signals.analyze_wolf_instance(instance_id, instance_data)
+            self.assertEqual(result["slotsUsed"], 1)
+            self.assertEqual(result["_saturatedCycles"], 0)
+            self.assertEqual(result["signalPressure"], 0)
+        finally:
+            shutil.rmtree(tmpdir)
 
 
 class TestExpansionConfigWrite(unittest.TestCase):
@@ -919,6 +1055,166 @@ class TestKillVsKeepNetScore(unittest.TestCase):
         self.assertEqual(result["netScore"], result["score"] - result["keepScore"])
 
 
+class TestKillROEThreshold(unittest.TestCase):
+    """Kill-vs-keep should only kill at -3% ROE, not at minor fluctuation."""
+
+    def _load_brain(self):
+        return _import_hyphenated(
+            "cobra_brain", os.path.join(SCRIPTS_DIR, "cobra-brain.py"))
+
+    def test_no_kill_at_minor_negative_roe(self):
+        """Avg ROE -0.4% should NOT trigger a kill (normal fluctuation)."""
+        brain = self._load_brain()
+        config = {"killVsKeep": {
+            "signalPressureKillThreshold": 60, "idleHoursBeforeKill": 2,
+            "avgFeePerTrade": 32, "maxDrawdownPct": 20,
+        }}
+        signal_data = {"instances": {"wolf-x": {
+            "signalPressure": 20,
+            "positionQuality": {"phase1": 2, "tier1": 0, "tier2plus": 0},
+            "avgPositionROE": -0.4,
+            "slotsUsed": 2,
+        }}}
+        perf_data = {"instances": {"wolf-x": {
+            "accountValue": 490, "unrealizedPnl": -10, "utilization": 60,
+            "drawdownFromPeak": 2, "tradeStats": {"activePositions": 2},
+        }}}
+        result = brain._evaluate_kill_vs_keep(
+            "wolf-x", {"type": "wolf", "budget": 500,
+                        "spawnedAt": "2020-01-01T00:00:00Z"},
+            signal_data, perf_data, config)
+        self.assertNotEqual(result["decision"], "KILL")
+
+    def test_kills_at_significant_negative_roe(self):
+        """Avg ROE -5% with all Phase 1 should trigger kill score boost."""
+        brain = self._load_brain()
+        config = {"killVsKeep": {
+            "signalPressureKillThreshold": 60, "idleHoursBeforeKill": 2,
+            "avgFeePerTrade": 32, "maxDrawdownPct": 20,
+        }}
+        signal_data = {"instances": {"wolf-y": {
+            "signalPressure": 70,
+            "positionQuality": {"phase1": 2, "tier1": 0, "tier2plus": 0},
+            "avgPositionROE": -5.0,
+            "slotsUsed": 2,
+        }}}
+        perf_data = {"instances": {"wolf-y": {
+            "accountValue": 450, "unrealizedPnl": -50, "utilization": 60,
+            "drawdownFromPeak": 10, "tradeStats": {"activePositions": 2},
+        }}}
+        result = brain._evaluate_kill_vs_keep(
+            "wolf-y", {"type": "wolf", "budget": 500,
+                        "spawnedAt": "2020-01-01T00:00:00Z"},
+            signal_data, perf_data, config)
+        kill_reasons = [r for r in result["reasons"] if "Phase 1" in r]
+        self.assertTrue(len(kill_reasons) > 0)
+
+
+class TestRebalanceHaltedInstance(unittest.TestCase):
+    """Halted instances should be rebalanced immediately regardless of age."""
+
+    def _load_brain(self):
+        return _import_hyphenated(
+            "cobra_brain", os.path.join(SCRIPTS_DIR, "cobra-brain.py"))
+
+    def _base_config(self, **overrides):
+        cfg = {
+            "totalBudget": 10000, "minSpawnBudget": 500,
+            "maxWolves": 2, "maxTigers": 1, "reservePct": 15,
+            "killVsKeep": {"signalPressureSpawnThreshold": 50},
+        }
+        cfg.update(overrides)
+        return cfg
+
+    def test_halted_tiger_rebalanced_immediately(self):
+        """Tiger that halted itself should be rebalanced without waiting for idle hours."""
+        brain = self._load_brain()
+        from cobra_config import utc_now
+        signal = {
+            "instances": {
+                "tiger-halted": {"signalPressure": 0, "halted": True,
+                                 "haltReason": "Target requires 999%/day"},
+                "wolf-ok": {"signalPressure": 25},
+            },
+        }
+        perf = {
+            "instances": {
+                "tiger-halted": {"accountValue": 500, "utilization": 0},
+                "wolf-ok": {"accountValue": 500, "utilization": 60},
+            },
+        }
+        instances = {
+            "tiger-halted": {
+                "type": "tiger", "status": "active", "budget": 500,
+                "spawnedAt": utc_now(),
+            },
+            "wolf-ok": {
+                "type": "wolf", "status": "active", "budget": 500,
+                "spawnedAt": "2020-01-01T00:00:00Z",
+            },
+        }
+        rebs = brain._decide_rebalances(signal, perf, self._base_config(), instances)
+        self.assertEqual(len(rebs), 1)
+        self.assertEqual(rebs[0]["fromInstance"], "tiger-halted")
+        self.assertIn("HALTED", rebs[0]["reason"])
+
+    def test_non_halted_still_needs_pressure(self):
+        """Non-halted idle instance still requires cross-type pressure >= 35."""
+        brain = self._load_brain()
+        signal = {
+            "instances": {
+                "tiger-idle": {"signalPressure": 0, "halted": False},
+                "wolf-quiet": {"signalPressure": 20},
+            },
+        }
+        perf = {
+            "instances": {
+                "tiger-idle": {"accountValue": 1000, "utilization": 0},
+                "wolf-quiet": {"accountValue": 500, "utilization": 10},
+            },
+        }
+        instances = {
+            "tiger-idle": {
+                "type": "tiger", "status": "active", "budget": 1000,
+                "spawnedAt": "2020-01-01T00:00:00Z",
+            },
+            "wolf-quiet": {
+                "type": "wolf", "status": "active", "budget": 500,
+                "spawnedAt": "2020-01-01T00:00:00Z",
+            },
+        }
+        rebs = brain._decide_rebalances(signal, perf, self._base_config(), instances)
+        self.assertEqual(len(rebs), 0)
+
+    def test_rebalance_at_pressure_35(self):
+        """Cross-type pressure >= 35 should trigger rebalance (lowered from 50)."""
+        brain = self._load_brain()
+        signal = {
+            "instances": {
+                "tiger-idle": {"signalPressure": 0},
+                "wolf-hot": {"signalPressure": 40},
+            },
+        }
+        perf = {
+            "instances": {
+                "tiger-idle": {"accountValue": 1000, "utilization": 0},
+                "wolf-hot": {"accountValue": 500, "utilization": 60},
+            },
+        }
+        instances = {
+            "tiger-idle": {
+                "type": "tiger", "status": "active", "budget": 1000,
+                "spawnedAt": "2020-01-01T00:00:00Z",
+            },
+            "wolf-hot": {
+                "type": "wolf", "status": "active", "budget": 500,
+                "spawnedAt": "2020-01-01T00:00:00Z",
+            },
+        }
+        rebs = brain._decide_rebalances(signal, perf, self._base_config(), instances)
+        self.assertEqual(len(rebs), 1)
+
+
 class TestSignalPressureScoring(unittest.TestCase):
 
     def setUp(self):
@@ -950,27 +1246,33 @@ class TestSignalPressureScoring(unittest.TestCase):
         self.assertEqual(result["missedFirstJumps1h"], 3)
         self.assertEqual(result["signalPressure"], 45)
 
-    def test_wolf_traded_assets_not_counted_as_missed(self):
-        """Signals for assets already in DSL (active or closed) are not missed."""
+    def test_wolf_active_positions_not_counted_as_missed(self):
+        """Only active DSL positions are excluded from missed signal counts."""
         now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         self._write_json("emerging-movers-history.json", [
             {"timestamp": now_ts, "markets": [
                 {"isFirstJump": True, "asset": "HYPE"},
                 {"isFirstJump": True, "asset": "SOL"},
+                {"isFirstJump": True, "asset": "ZEC"},
             ]}
         ])
         self._write_json("dsl-HYPE.json", {
             "active": True, "asset": "HYPE", "direction": "LONG",
             "entryPrice": 100, "currentPrice": 105, "phase": 1,
         })
+        self._write_json("dsl-ZEC.json", {
+            "active": False, "asset": "ZEC", "direction": "SHORT",
+            "entryPrice": 200, "currentPrice": 201, "closedBy": "cobra-kill",
+        })
         with patch.object(self.signals, "get_instance_workspace", return_value=self.tmpdir), \
              patch.object(self.signals, "get_instance_state_dir", return_value=self.tmpdir):
             result = self.signals.analyze_wolf_instance("wolf-1", {"slots": 3})
-        self.assertEqual(result["missedFirstJumps1h"], 1)
-        self.assertEqual(result["signalPressure"], 15)
+        # HYPE excluded (active), ZEC counted (closed), SOL counted
+        self.assertEqual(result["missedFirstJumps1h"], 2)
+        self.assertGreaterEqual(result["signalPressure"], 30)
 
     def test_wolf_slots_full_bonus(self):
-        """Slots full adds +10 when there's existing pressure."""
+        """Slots full adds base +25 plus saturation escalation on top of FIRST_JUMP pressure."""
         now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         self._write_json("emerging-movers-history.json", [
             {"timestamp": now_ts, "markets": [{"isFirstJump": True}]}
@@ -985,7 +1287,8 @@ class TestSignalPressureScoring(unittest.TestCase):
              patch.object(self.signals, "get_instance_state_dir", return_value=self.tmpdir):
             result = self.signals.analyze_wolf_instance("wolf-1", {"slots": 2})
         self.assertEqual(result["slotsUsed"], 2)
-        self.assertEqual(result["signalPressure"], 25)
+        # 15 (FIRST_JUMP) + 25 (slot sat base) + 5 (1 cycle * 5) = 45
+        self.assertEqual(result["signalPressure"], 45)
 
     def test_tiger_high_confluence(self):
         """Prescreened candidates with score >= 65 count as high-confluence."""

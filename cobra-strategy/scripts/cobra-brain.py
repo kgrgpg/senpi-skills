@@ -178,13 +178,13 @@ def _evaluate_kill_vs_keep(instance_id, instance_data, signal_data, perf_data, c
 
     kill_score = 0
 
-    # All positions Phase 1 + negative ROE
+    # All positions Phase 1 + significant negative ROE (not just noise)
     if itype == "wolf":
         pos_quality = instance_signals.get("positionQuality", {})
         phase1 = pos_quality.get("phase1", 0)
         tier1 = pos_quality.get("tier1", 0)
         avg_roe = instance_signals.get("avgPositionROE", 0)
-        if active_positions > 0 and phase1 == active_positions and avg_roe < 0:
+        if active_positions > 0 and phase1 == active_positions and avg_roe < -3:
             kill_score += 30
             reasons.append(f"KILL signal: all {phase1} positions Phase 1 with avg ROE {avg_roe}%")
 
@@ -353,10 +353,11 @@ def _decide_spawns(regime_data, signal_data, state, config, current_instances):
 
 
 _MAX_EXPANDED_SLOTS = 5
-_EXPANSION_SIGNAL_THRESHOLD = 60
+_EXPANSION_SIGNAL_THRESHOLD = 40
+_EXPANSION_AGGRESSIVE_THRESHOLD = 80
 _EXPANSION_MAX_UTILIZATION = 70
 _EXPANSION_MIN_LIQ_BUFFER = 50
-_REBALANCE_IDLE_HOURS = 2
+_REBALANCE_IDLE_HOURS = 1
 _REBALANCE_MIN_UTIL = 5
 _REBALANCE_MIN_REMAINING = 400
 
@@ -367,6 +368,9 @@ def _decide_expansions(signal_data, perf_data, config, current_instances):
     When an instance is at max slots and reporting high signal pressure
     (missed opportunities), increase its slot count so the next scan cycle
     can open additional positions — provided risk gates pass.
+
+    Uses monitor position count (from MCP clearinghouse) as fallback when
+    signal module can't read subagent scan files.
 
     Returns list of {"instanceId", "newSlots", "newMarginPerSlot", "reason"}.
     """
@@ -383,16 +387,21 @@ def _decide_expansions(signal_data, perf_data, config, current_instances):
             continue
 
         inst_signals = signal_data.get("instances", {}).get(iid, {})
+        inst_perf = perf_data.get("instances", {}).get(iid, {})
+
         pressure = inst_signals.get("signalPressure", 0)
         slots_used = inst_signals.get("slotsUsed", 0)
         slots_max = inst_signals.get("slotsMax", current_slots)
+
+        monitor_positions = inst_perf.get("positionCount", 0)
+        if monitor_positions > slots_used:
+            slots_used = monitor_positions
 
         if pressure < _EXPANSION_SIGNAL_THRESHOLD:
             continue
         if slots_used < slots_max:
             continue
 
-        inst_perf = perf_data.get("instances", {}).get(iid, {})
         account_value = inst_perf.get("accountValue", 0)
         utilization = inst_perf.get("utilization", 0)
 
@@ -401,7 +410,8 @@ def _decide_expansions(signal_data, perf_data, config, current_instances):
         if utilization > _EXPANSION_MAX_UTILIZATION:
             continue
 
-        new_slots = min(current_slots + 1, _MAX_EXPANDED_SLOTS)
+        increment = 2 if pressure >= _EXPANSION_AGGRESSIVE_THRESHOLD else 1
+        new_slots = min(current_slots + increment, _MAX_EXPANDED_SLOTS)
         new_margin = round(account_value * 0.30 / new_slots, 2)
 
         expansions.append({
@@ -444,35 +454,51 @@ def _decide_rebalances(signal_data, perf_data, config, current_instances):
         budget = idata.get("budget", 0)
         spawned_at = idata.get("spawnedAt", "")
 
+        inst_signals = signal_data.get("instances", {}).get(iid, {})
         inst_perf = perf_data.get("instances", {}).get(iid, {})
         utilization = inst_perf.get("utilization", 0)
         account_value = inst_perf.get("accountValue", budget)
 
-        if utilization >= _REBALANCE_MIN_UTIL:
+        is_halted = inst_signals.get("halted", False)
+
+        if is_halted:
+            pass
+        elif utilization >= _REBALANCE_MIN_UTIL:
             continue
-        hours_alive = minutes_since(spawned_at) / 60
-        if hours_alive < _REBALANCE_IDLE_HOURS:
-            continue
+        else:
+            hours_alive = minutes_since(spawned_at) / 60
+            if hours_alive < _REBALANCE_IDLE_HOURS:
+                continue
 
         other_pressure = tiger_pressure if itype == "wolf" else wolf_pressure
-        if other_pressure < 50:
+        if not is_halted and other_pressure < 35:
             continue
 
-        rebalance_amount = round(account_value * 0.50, 2)
-        if (account_value - rebalance_amount) < _REBALANCE_MIN_REMAINING:
-            rebalance_amount = max(0, account_value - _REBALANCE_MIN_REMAINING)
-        if rebalance_amount < config.get("minSpawnBudget", 500):
+        min_spawn = config.get("minSpawnBudget", 500)
+        if is_halted:
+            rebalance_amount = round(account_value, 2)
+        else:
+            rebalance_amount = round(account_value * 0.50, 2)
+            if (account_value - rebalance_amount) < _REBALANCE_MIN_REMAINING:
+                rebalance_amount = max(0, account_value - _REBALANCE_MIN_REMAINING)
+        if rebalance_amount < min_spawn:
             continue
 
         target_type = "tiger" if itype == "wolf" else "wolf"
+        hours_alive = minutes_since(spawned_at) / 60
+        if is_halted:
+            reason = (f"{iid} HALTED ({inst_signals.get('haltReason', 'unknown')}), "
+                      f"rebalancing ${rebalance_amount:.0f} to {target_type}")
+        else:
+            reason = (f"{iid} idle ({utilization:.0f}% util for {hours_alive:.1f}h), "
+                      f"{target_type} pressure={other_pressure}, "
+                      f"rebalancing ${rebalance_amount:.0f}")
         rebalances.append({
             "fromInstance": iid,
             "fromType": itype,
             "toType": target_type,
             "amount": rebalance_amount,
-            "reason": (f"{iid} idle ({utilization:.0f}% util for {hours_alive:.1f}h), "
-                       f"{target_type} pressure={other_pressure}, "
-                       f"rebalancing ${rebalance_amount:.0f}"),
+            "reason": reason,
         })
 
     return rebalances

@@ -117,8 +117,6 @@ def analyze_wolf_instance(instance_id, instance_data):
                 else:
                     roe = (entry - current) / entry * 100
                 roe_values.append(roe)
-        elif asset:
-            traded_assets.add(asset.upper())
 
     if roe_values:
         result["avgPositionROE"] = round(sum(roe_values) / len(roe_values), 2)
@@ -166,12 +164,30 @@ def analyze_wolf_instance(instance_id, instance_data):
                     if hours_ago(scan_time, 4):
                         result["missedOpportunities4h"] += 1
 
+    # --- Slot saturation tracking ---
+    # When subagent scan history files live in a separate workspace (common
+    # in mode="run" deployments), missedFirstJumps/Opportunities will be 0.
+    # Slot saturation provides meaningful pressure from DSL state alone.
+    prev_signals = load_json_safe(SIGNAL_PRESSURE_FILE) or {}
+    prev_inst = prev_signals.get("instances", {}).get(instance_id, {})
+
+    if result["slotsUsed"] >= result["slotsMax"] and result["slotsMax"] > 0:
+        prev_cycles = prev_inst.get("_saturatedCycles", 0)
+        result["_saturatedCycles"] = prev_cycles + 1
+    else:
+        result["_saturatedCycles"] = 0
+
     # --- Compute signal pressure score ---
     pressure = 0
     pressure += result["missedFirstJumps1h"] * 15
+    pressure += max(0, result["missedFirstJumps4h"] - result["missedFirstJumps1h"]) * 5
     pressure += result["missedOpportunities1h"] * 8
-    if result["slotsUsed"] >= result["slotsMax"] and pressure > 0:
-        pressure += 10
+    pressure += max(0, result["missedOpportunities4h"] - result["missedOpportunities1h"]) * 3
+
+    if result["slotsUsed"] >= result["slotsMax"] and result["slotsMax"] > 0:
+        pressure += 25
+        pressure += min(result["_saturatedCycles"] * 5, 25)
+
     result["signalPressure"] = min(100, pressure)
 
     return result
@@ -235,7 +251,13 @@ def analyze_tiger_instance(instance_id, instance_data):
             result["slotsUsed"] = int(active_positions)
         result["aggression"] = tiger_state.get("aggression", "NORMAL")
         safety = tiger_state.get("safety", {})
-        result["halted"] = safety.get("halted", False)
+        result["halted"] = (tiger_state.get("halted", False)
+                            or safety.get("halted", False))
+        if result["halted"]:
+            result["haltReason"] = (tiger_state.get("haltReason")
+                                    or tiger_state.get("halt_reason")
+                                    or safety.get("haltReason")
+                                    or "unknown")
         total_trades = tiger_state.get("totalTrades", 0)
         total_wins = tiger_state.get("totalWins", 0)
         if total_trades > 0:
@@ -276,15 +298,24 @@ def analyze_tiger_instance(instance_id, instance_data):
         else:
             result["positionQuality"]["tier2plus"] += 1
 
+    # --- Slot saturation tracking ---
+    prev_signals = load_json_safe(SIGNAL_PRESSURE_FILE) or {}
+    prev_inst = prev_signals.get("instances", {}).get(instance_id, {})
+
+    if result["slotsUsed"] >= result["slotsMax"] and result["slotsMax"] > 0:
+        prev_cycles = prev_inst.get("_saturatedCycles", 0)
+        result["_saturatedCycles"] = prev_cycles + 1
+    else:
+        result["_saturatedCycles"] = 0
+
     # --- Compute signal pressure score ---
-    # Density bonus uses a higher threshold (35) and gentler multiplier (3)
-    # so normal candidate counts (20-30) don't inflate pressure.
     pressure = 0
     pressure += result["highConfluenceCount"] * 10
     if result["prescreenerDensity"] >= 35:
         pressure += (result["prescreenerDensity"] - 25) * 3
-    if result["slotsUsed"] >= result["slotsMax"] and result["prescreenerDensity"] > 0:
-        pressure += 15
+    if result["slotsUsed"] >= result["slotsMax"] and result["slotsMax"] > 0:
+        pressure += 25
+        pressure += min(result["_saturatedCycles"] * 5, 25)
     if result["aggression"] in ("ELEVATED", "ABORT"):
         pressure += 10
     if result["halted"]:

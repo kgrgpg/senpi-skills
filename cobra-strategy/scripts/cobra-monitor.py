@@ -148,14 +148,17 @@ def monitor_instance(instance_id, instance_data):
 
     ch = fetch_clearinghouse(wallet) if wallet else None
     if ch:
-        ms, _ = parse_clearinghouse(ch)
+        ms, positions = parse_clearinghouse(ch)
         account_value = float(ms.get("accountValue", ms.get("equity", 0)))
         margin_used = float(ms.get("marginUsed", ms.get("totalMarginUsed", 0)))
         upnl = float(ms.get("unrealizedPnl", ms.get("crossUnrealizedPnl", 0)))
 
+        active_positions = [p for p in positions
+                            if float(p.get("szi", p.get("size", 0))) != 0]
         metrics["accountValue"] = round(account_value, 2)
         metrics["marginUsed"] = round(margin_used, 2)
         metrics["unrealizedPnl"] = round(upnl, 2)
+        metrics["positionCount"] = len(active_positions)
 
         if spawn_budget > 0:
             metrics["roeSinceSpawn"] = round(
