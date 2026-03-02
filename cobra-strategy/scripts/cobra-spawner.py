@@ -30,6 +30,7 @@ from cobra_config import (
     load_config, load_spawned_instances, save_spawned_instance,
     get_instance_state_dir, get_instance_workspace, ensure_instance_workspace,
     mcporter_call, mcporter_call_safe,
+    get_clearinghouse_state, parse_clearinghouse,
     atomic_write, output, utc_now, load_json_safe, minutes_since,
     WORKSPACE, COBRA_STATE_DIR, SPAWNED_DIR,
 )
@@ -49,6 +50,7 @@ def _resolve_scripts_dir(instance_type):
         ]
     else:
         candidates = [
+            os.path.join(WORKSPACE, "skills", "tiger-strategy", "scripts"),
             os.path.join(WORKSPACE, "skills", "tiger", "scripts"),
             os.path.normpath(TIGER_SCRIPTS),
         ]
@@ -252,19 +254,59 @@ def _compute_leverage(budget, regime="TRENDING"):
     return base
 
 
+_STRATEGY_POLL_INTERVAL = 5
+_STRATEGY_POLL_MAX_WAIT = 60
+_MIN_TOP_UP = 1
+
+
+def _poll_strategy_wallet(strategy_uuid):
+    """Poll strategy_list until a newly created strategy has a wallet address.
+
+    strategy_create_custom_strategy is async — it returns immediately with a
+    strategyId but the wallet address appears later via strategy_list once
+    the on-chain wallet is provisioned.
+    """
+    deadline = time.time() + _STRATEGY_POLL_MAX_WAIT
+    while time.time() < deadline:
+        strategies = mcporter_call_safe("strategy_list")
+        if strategies:
+            items = (strategies if isinstance(strategies, list)
+                     else strategies.get("strategies", strategies.get("data", [])))
+            for s in items:
+                sid = s.get("strategyId", s.get("id", ""))
+                if sid == strategy_uuid:
+                    wallet = s.get("wallet", s.get("address", ""))
+                    if wallet:
+                        return wallet
+        time.sleep(_STRATEGY_POLL_INTERVAL)
+    return None
+
+
 def _create_and_fund_wallet(budget, name, config=None):
     """Create a strategy wallet and fund it. Shared by wolf and tiger spawns.
 
+    Handles Senpi MCP specifics discovered at runtime:
+    - initialBudget must be int (MCP rejects float)
+    - positions requires full objects with coin/leverage/leverageType/direction/marginAmount
+    - Creation is async: wallet address arrives via strategy_list polling
+    - Clearinghouse uses strategy_wallet param and nested main.marginSummary response
+    - Minimum top-up is $1
+
     Returns (wallet, strategy_uuid) on success.
-    Raises RuntimeError or returns an error dict on failure, cleaning up
-    the orphaned strategy if funding fails.
+    Returns an error dict on failure, cleaning up the orphaned strategy.
     """
     try:
         create_result = mcporter_call(
             "strategy_create_custom_strategy",
             name=name,
-            initialBudget=budget,
-            positions=[{"asset": "BTC"}],
+            initialBudget=int(budget),
+            positions=[{
+                "coin": "BTC",
+                "leverage": 10,
+                "leverageType": "CROSS",
+                "direction": "LONG",
+                "marginAmount": 1,
+            }],
         )
         wallet = create_result.get("wallet", create_result.get("address", ""))
         strategy_uuid = create_result.get("strategyId", create_result.get("id", ""))
@@ -272,35 +314,39 @@ def _create_and_fund_wallet(budget, name, config=None):
         return {"success": False, "error": f"Failed to create strategy: {e}"}
 
     if not wallet:
-        return {"success": False, "error": "No wallet returned from strategy creation"}
+        wallet = _poll_strategy_wallet(strategy_uuid)
+    if not wallet:
+        mcporter_call_safe("strategy_delete", strategyId=strategy_uuid)
+        return {"success": False,
+                "error": f"Strategy {strategy_uuid} created but wallet never appeared"}
 
-    # Check if creation already funded the wallet (initialBudget may or may not
-    # transfer funds depending on MCP version). Only top up if needed.
-    verify_ch = mcporter_call_safe("strategy_get_clearinghouse_state", wallet=wallet)
-    current_value = 0
-    if verify_ch:
-        current_value = float(verify_ch.get("accountValue", verify_ch.get("equity", 0)))
+    # Check if creation already funded the wallet via initialBudget.
+    ch = get_clearinghouse_state(wallet)
+    ms, _ = parse_clearinghouse(ch)
+    current_value = float(ms.get("accountValue", ms.get("equity", 0)))
 
     if current_value < budget * 0.95:
         top_up_amount = budget - current_value
-        try:
-            mcporter_call("strategy_top_up", amount=top_up_amount, strategyId=strategy_uuid)
-        except RuntimeError as e:
-            mcporter_call_safe("strategy_delete", strategyId=strategy_uuid)
-            return {"success": False, "error": f"Failed to fund strategy: {e}",
-                    "wallet": wallet, "strategyId": strategy_uuid}
+        if top_up_amount >= _MIN_TOP_UP:
+            try:
+                mcporter_call("strategy_top_up",
+                              amount=top_up_amount, strategyId=strategy_uuid)
+            except RuntimeError as e:
+                mcporter_call_safe("strategy_delete", strategyId=strategy_uuid)
+                return {"success": False, "error": f"Failed to fund strategy: {e}",
+                        "wallet": wallet, "strategyId": strategy_uuid}
 
-    verify_ch = mcporter_call_safe("strategy_get_clearinghouse_state", wallet=wallet)
-    if verify_ch:
-        actual_value = float(verify_ch.get("accountValue", verify_ch.get("equity", 0)))
-        if actual_value < budget * 0.95:
-            mcporter_call_safe("strategy_delete", strategyId=strategy_uuid)
-            return {
-                "success": False,
-                "error": f"Funding verification failed: expected ~${budget:.0f}, "
-                         f"got ${actual_value:.0f}",
-                "wallet": wallet, "strategyId": strategy_uuid,
-            }
+    ch = get_clearinghouse_state(wallet)
+    ms, _ = parse_clearinghouse(ch)
+    actual_value = float(ms.get("accountValue", ms.get("equity", 0)))
+    if actual_value < budget * 0.90:
+        mcporter_call_safe("strategy_delete", strategyId=strategy_uuid)
+        return {
+            "success": False,
+            "error": f"Funding verification failed: expected ~${budget:.0f}, "
+                     f"got ${actual_value:.0f}",
+            "wallet": wallet, "strategyId": strategy_uuid,
+        }
 
     return wallet, strategy_uuid
 
@@ -626,9 +672,9 @@ def _close_positions_via_clearinghouse(wallet, instance_id, itype):
     close_results = []
     state_dir = get_instance_state_dir(instance_id, itype)
 
-    ch = mcporter_call_safe("strategy_get_clearinghouse_state", wallet=wallet)
+    ch = get_clearinghouse_state(wallet)
     if ch:
-        positions = ch.get("positions", ch.get("assetPositions", []))
+        _, positions = parse_clearinghouse(ch)
         for pos in positions:
             asset = pos.get("coin", pos.get("asset", ""))
             if not asset:
@@ -704,14 +750,14 @@ def kill_instance(instance_id, reason="brain_decision"):
     close_results, ch_before = _close_positions_via_clearinghouse(
         wallet, instance_id, itype)
 
-    final_ch = mcporter_call_safe("strategy_get_clearinghouse_state", wallet=wallet)
-    final_value = float(final_ch.get("accountValue", final_ch.get("equity", 0))) if final_ch else 0
+    final_ch = get_clearinghouse_state(wallet)
+    final_ms, final_positions = parse_clearinghouse(final_ch)
+    final_value = float(final_ms.get("accountValue", final_ms.get("equity", 0)))
     realized_pnl = round(final_value - budget, 2)
 
     remaining_positions = 0
     if final_ch:
-        positions = final_ch.get("positions", final_ch.get("assetPositions", []))
-        for pos in positions:
+        for pos in final_positions:
             size = abs(float(pos.get("szi", pos.get("size", 0))))
             if size > 0:
                 remaining_positions += 1

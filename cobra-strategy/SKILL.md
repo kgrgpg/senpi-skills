@@ -241,9 +241,10 @@ summary, no explanation.
 | Tool | Used By | Purpose |
 |------|---------|---------|
 | `market_get_asset_data` | cobra-regime.py, cobra-brain.py | BTC candles for regime classification |
-| `strategy_create_custom_strategy` | cobra-spawner.py | Create new wallet for spawned instance |
-| `strategy_top_up` | cobra-spawner.py | Fund spawned instance |
-| `strategy_get_clearinghouse_state` | cobra-monitor.py, cobra-brain.py, cobra-spawner.py | Balance + positions per instance |
+| `strategy_create_custom_strategy` | cobra-spawner.py | Create new wallet (async — poll `strategy_list` for wallet). Requires `initialBudget` (int) and `positions` (full objects with coin/leverage/leverageType/direction/marginAmount) |
+| `strategy_list` | cobra-spawner.py | Poll for wallet address after async strategy creation |
+| `strategy_top_up` | cobra-spawner.py | Fund spawned instance (min $1) |
+| `strategy_get_clearinghouse_state` | cobra-monitor.py, cobra-brain.py, cobra-spawner.py | Balance + positions per instance. Param: `strategy_wallet`. Response nested under `main.marginSummary` |
 | `close_position` | cobra-spawner.py | Close positions when killing instance |
 | `strategy_withdraw` | cobra-spawner.py | Recover funds from killed instance |
 | `strategy_delete` | cobra-spawner.py | Clean up orphaned strategy on funding failure |

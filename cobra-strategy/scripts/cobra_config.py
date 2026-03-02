@@ -288,6 +288,39 @@ def mcporter_call_safe(tool, retries=3, timeout=30, **kwargs):
         return None
 
 
+def get_clearinghouse_state(wallet):
+    """Fetch clearinghouse state for a strategy wallet via MCP.
+
+    Uses strategy_wallet param (Senpi MCP convention). Returns None on failure.
+    """
+    return mcporter_call_safe(
+        "strategy_get_clearinghouse_state", strategy_wallet=wallet)
+
+
+def parse_clearinghouse(ch):
+    """Extract margin summary and positions from a clearinghouse response.
+
+    Handles both nested (main.marginSummary) and flat response formats
+    so callers don't need to know the MCP response shape.
+
+    Returns:
+        (margin_dict, positions_list) — margin_dict has accountValue,
+        totalMarginUsed, etc. positions_list has unwrapped position dicts.
+    """
+    if not ch:
+        return {}, []
+    main = ch.get("main", ch)
+    ms = main.get("marginSummary", main)
+    positions = main.get("assetPositions", main.get("positions", []))
+    unwrapped = []
+    for p in positions:
+        if isinstance(p, dict) and "position" in p:
+            unwrapped.append(p["position"])
+        else:
+            unwrapped.append(p)
+    return ms, unwrapped
+
+
 # --- Utility functions ---
 
 def atomic_write(path, data):

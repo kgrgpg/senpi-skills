@@ -890,6 +890,67 @@ class TestTrappedCapitalAccounting(unittest.TestCase):
             os.unlink(killed_path)
 
 
+class TestParseClearinghouse(unittest.TestCase):
+    """parse_clearinghouse handles both flat and nested response formats."""
+
+    def test_nested_format(self):
+        import cobra_config
+        ch = {"main": {
+            "marginSummary": {"accountValue": "1000", "totalMarginUsed": "200"},
+            "assetPositions": [{"coin": "BTC", "szi": "0.01"}],
+        }}
+        ms, positions = cobra_config.parse_clearinghouse(ch)
+        self.assertEqual(ms["accountValue"], "1000")
+        self.assertEqual(len(positions), 1)
+        self.assertEqual(positions[0]["coin"], "BTC")
+
+    def test_flat_format(self):
+        import cobra_config
+        ch = {"accountValue": 500, "positions": [{"coin": "ETH", "szi": "1"}]}
+        ms, positions = cobra_config.parse_clearinghouse(ch)
+        self.assertEqual(ms["accountValue"], 500)
+        self.assertEqual(len(positions), 1)
+
+    def test_unwraps_position_objects(self):
+        import cobra_config
+        ch = {"main": {
+            "marginSummary": {"accountValue": "1000"},
+            "assetPositions": [
+                {"type": "oneWay", "position": {"coin": "SOL", "szi": "5"}},
+            ],
+        }}
+        ms, positions = cobra_config.parse_clearinghouse(ch)
+        self.assertEqual(positions[0]["coin"], "SOL")
+
+    def test_none_input(self):
+        import cobra_config
+        ms, positions = cobra_config.parse_clearinghouse(None)
+        self.assertEqual(ms, {})
+        self.assertEqual(positions, [])
+
+    def test_empty_input(self):
+        import cobra_config
+        ms, positions = cobra_config.parse_clearinghouse({})
+        self.assertEqual(positions, [])
+
+
+class TestTigerScriptsResolution(unittest.TestCase):
+    """Tiger scripts dir should resolve tiger-strategy before tiger."""
+
+    def test_tiger_strategy_path_tried_first(self):
+        spawner = _import_hyphenated(
+            "cobra_spawner", os.path.join(SCRIPTS_DIR, "cobra-spawner.py"))
+        tmpdir = tempfile.mkdtemp()
+        try:
+            ts_dir = os.path.join(tmpdir, "skills", "tiger-strategy", "scripts")
+            os.makedirs(ts_dir)
+            with patch.object(spawner, "WORKSPACE", tmpdir):
+                result = spawner._resolve_scripts_dir("tiger")
+            self.assertIn("tiger-strategy", result)
+        finally:
+            shutil.rmtree(tmpdir)
+
+
 class TestKillFlowMCPFailure(unittest.TestCase):
     """TIGER kill with MCP failure must set kill_pending, not killed."""
 
@@ -920,7 +981,8 @@ class TestKillFlowMCPFailure(unittest.TestCase):
             "spawnedAt": "2026-02-28T10:00:00Z", "cronNames": [],
         })
         try:
-            with patch.object(self.spawner, "mcporter_call_safe", return_value=None):
+            with patch.object(self.spawner, "get_clearinghouse_state", return_value=None), \
+                 patch.object(self.spawner, "mcporter_call_safe", return_value=None):
                 result = self.spawner.kill_instance("tiger-killtest", reason="test")
             self.assertTrue(result["success"])
             self.assertEqual(result["killStatus"], "kill_pending")
@@ -935,7 +997,8 @@ class TestKillFlowMCPFailure(unittest.TestCase):
             "spawnedAt": "2026-02-28T10:00:00Z", "cronNames": [],
         })
         try:
-            with patch.object(self.spawner, "mcporter_call_safe", return_value=None):
+            with patch.object(self.spawner, "get_clearinghouse_state", return_value=None), \
+                 patch.object(self.spawner, "mcporter_call_safe", return_value=None):
                 result = self.spawner.kill_instance("wolf-killtest", reason="test")
             self.assertTrue(result["success"])
             self.assertEqual(result["killStatus"], "kill_pending")
@@ -950,7 +1013,7 @@ class TestKillFlowMCPFailure(unittest.TestCase):
         with open(dsl_path, "w") as f:
             json.dump({"active": True, "asset": "ETH", "direction": "LONG"}, f)
         try:
-            with patch.object(self.spawner, "mcporter_call_safe", return_value=None), \
+            with patch.object(self.spawner, "get_clearinghouse_state", return_value=None), \
                  patch.object(self.spawner, "get_instance_state_dir", return_value=state_dir):
                 results, ch = self.spawner._close_positions_via_clearinghouse(
                     "0xfake", "tiger-chtest", "tiger")
@@ -970,15 +1033,17 @@ class TestKillFlowMCPFailure(unittest.TestCase):
             "spawnedAt": "2026-02-28T10:00:00Z", "cronNames": [],
         })
         fake_ch = {
-            "accountValue": 2900,
-            "positions": [
-                {"coin": "ETH", "szi": "1.5"},
-                {"coin": "SOL", "szi": "10"},
-            ],
+            "main": {
+                "marginSummary": {"accountValue": "2900"},
+                "assetPositions": [
+                    {"coin": "ETH", "szi": "1.5"},
+                    {"coin": "SOL", "szi": "10"},
+                ],
+            }
         }
         call_count = {"n": 0}
 
-        def mock_safe(*args, **kwargs):
+        def mock_ch(*args, **kwargs):
             call_count["n"] += 1
             if call_count["n"] <= 1:
                 return fake_ch
@@ -988,8 +1053,9 @@ class TestKillFlowMCPFailure(unittest.TestCase):
             raise RuntimeError("MCP close failed")
 
         try:
-            with patch.object(self.spawner, "mcporter_call_safe", side_effect=mock_safe), \
-                 patch.object(self.spawner, "mcporter_call", side_effect=mock_call):
+            with patch.object(self.spawner, "get_clearinghouse_state", side_effect=mock_ch), \
+                 patch.object(self.spawner, "mcporter_call", side_effect=mock_call), \
+                 patch.object(self.spawner, "mcporter_call_safe", return_value=None):
                 result = self.spawner.kill_instance("tiger-closefail", reason="test")
             self.assertTrue(result["success"])
             self.assertEqual(result["killStatus"], "kill_pending")

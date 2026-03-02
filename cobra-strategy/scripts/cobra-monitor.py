@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cobra_config import (
     load_config, load_spawned_instances, load_performance, save_performance,
     get_instance_workspace, get_shared_workspace, get_instance_state_dir,
+    get_clearinghouse_state, parse_clearinghouse,
     mcporter_call_safe, load_json_safe, output, utc_now,
     COBRA_STATE_DIR,
 )
@@ -25,10 +26,7 @@ SIGNAL_PRESSURE_FILE = os.path.join(COBRA_STATE_DIR, "cobra-signals.json")
 
 def fetch_clearinghouse(wallet):
     """Fetch clearinghouse state for a wallet."""
-    return mcporter_call_safe(
-        "strategy_get_clearinghouse_state",
-        wallet=wallet,
-    )
+    return get_clearinghouse_state(wallet)
 
 
 def compute_wolf_trade_stats(state_dir):
@@ -141,12 +139,12 @@ def monitor_instance(instance_id, instance_data):
         "updatedAt": utc_now(),
     }
 
-    # Fetch clearinghouse state via MCP
     ch = fetch_clearinghouse(wallet) if wallet else None
     if ch:
-        account_value = float(ch.get("accountValue", ch.get("equity", 0)))
-        margin_used = float(ch.get("marginUsed", ch.get("totalMarginUsed", 0)))
-        upnl = float(ch.get("unrealizedPnl", ch.get("crossUnrealizedPnl", 0)))
+        ms, _ = parse_clearinghouse(ch)
+        account_value = float(ms.get("accountValue", ms.get("equity", 0)))
+        margin_used = float(ms.get("marginUsed", ms.get("totalMarginUsed", 0)))
+        upnl = float(ms.get("unrealizedPnl", ms.get("crossUnrealizedPnl", 0)))
 
         metrics["accountValue"] = round(account_value, 2)
         metrics["marginUsed"] = round(margin_used, 2)
